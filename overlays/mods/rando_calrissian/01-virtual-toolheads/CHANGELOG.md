@@ -6,6 +6,14 @@ only changes when the file format does.
 
 ## [0.6]
 
+- After a swap restart the calibrate screen no longer opens for a missing
+  Dynamic Flow K alone (the Calibrate button in the card header shows
+  instead). The result of board detection is a console status message rather
+  than a dialog; the dialog stays for unknown boards and conflicts. If a
+  toolhead MCU is lost outside the Swap flow ("Lost communication with MCU
+  'e2'"), a dialog asks whether a toolhead or nozzle was hot-swapped and
+  offers Restart firmware.
+
 - The status (read by Klipper's subscription about four times a second) does
   less work: the backup folder is listed again only when it changed, the print
   task is read once per call, and reading the status never starts a Spoolman
@@ -22,12 +30,6 @@ only changes when the file format does.
   module then publishes `auto_calibrate` (a request id, valid while something
   still needs calibrating, at most 10 minutes) and the card opens its panel
   once per id. Without a card the dialog opens as before.
-
-- After a swap restart the calibrate screen no longer opens just because a
-  filament is not identified yet (the spool is read a few seconds after the
-  restart). When the only gap is the flow K of such a filament, the module
-  waits up to 5 s for it; if it is still unknown the screen stays closed and
-  the card's Calibrate button shows until the filament is known.
 
 - Card: Calibrate is also in the Menu panel; the header Calibrate button only
   shows while an installed toolhead lacks an offset, PID tuning or flow K (or

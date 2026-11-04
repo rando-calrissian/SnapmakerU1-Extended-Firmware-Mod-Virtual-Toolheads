@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
-# SPDX-FileCopyrightText: Copyright (c) 2026 @rando-calrissian
+# SPDX-FileCopyrightText: Copyright (c) 2026 @YOUR-GITHUB-USERNAME
 
 # Virtual toolheads for the Snapmaker U1 (extended firmware)
 #
@@ -74,7 +74,7 @@ FLOW_LOOKUP_RETRY = 300.      # s before a failed Spoolman lookup is retried
 FLOW_LOOKUP_TIMEOUT = 5.      # s
 FLOW_EPS = 1e-9
 SWAP_MARKER_TTL = 14400.     # seconds a pending toolhead swap stays valid
-SWAP_RESUME_DELAY = 3.      # seconds after ready before the screen opens
+SWAP_RESUME_DELAY = 6.      # seconds after ready before the screen opens
 AUTO_CAL_TTL = 600.          # s a calibrate request stays open for the card
 FILAMENT_ID_WAIT = 5.       # s to wait for the filament to be identified
 FILAMENT_ID_POLL = 1.       # s between checks while waiting
@@ -1127,6 +1127,8 @@ class VirtualToolheads:
                                             self._handle_connect)
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_ready)
+        self.printer.register_event_handler("klippy:shutdown",
+                                            self._handle_shutdown)
         self.printer.register_event_handler(OFFSET_EVENT,
                                             self._handle_offset_event)
         self._resume_after_swap = False
@@ -1309,6 +1311,55 @@ class VirtualToolheads:
         except OSError:
             pass
         return at is not None and 0 <= time.time() - at <= SWAP_MARKER_TTL
+
+    LOST_MCU = re.compile(r"Lost communication with MCU '(e(\d+))'")
+
+    def _handle_shutdown(self):
+        """A toolhead MCU went silent.  If that is not part of a swap we
+        started, the likely cause is a toolhead or nozzle changed while the
+        printer was on: ask, and offer the firmware restart."""
+        try:
+            msg = self.printer.get_state_message()[0]
+        except Exception:
+            return
+        m = self.LOST_MCU.search(msg or "")
+        if m is None or self.store is None:
+            return
+        try:
+            if self._swap_marker_fresh():
+                return          # the Swap Tool flow expects this
+            slot = int(m.group(2))
+            if slot < self.store.n_slots:
+                who = "T%d (%s)" % (slot, self.store.label(
+                    self.store.layout[slot]))
+            else:
+                who = "toolhead MCU %s" % m.group(1)
+            self.trace_note("lost MCU %s: restart dialog" % m.group(1))
+            self._ui_restart_lost(m.group(1), who)
+        except Exception:
+            logging.exception("virtual_toolheads: could not show the lost "
+                              "MCU dialog")
+
+    def _swap_marker_fresh(self):
+        try:
+            with open(self._swap_marker()) as f:
+                at = float(json.load(f).get("at", 0))
+        except Exception:
+            return False
+        return 0 <= time.time() - at <= SWAP_MARKER_TTL
+
+    def _ui_restart_lost(self, mcu, who):
+        p = Prompt("Lost communication with MCU '%s'" % mcu)
+        p.text("Klipper lost contact with %s." % who)
+        p.text("Did you hot-swap a toolhead or nozzle without using Swap "
+               "Tool? If so, restart the firmware: swapped toolheads are "
+               "recognised on restart.")
+        p.text("If you did not touch it, check the toolhead cable first.")
+        p.buttons([("Restart firmware", "VT_RESTART", "warning")],
+                  per_row=1)
+        p.restart = True
+        p.buttons([("Close", ui_cmd("close"), "secondary")])
+        self._show(p)
 
     def _handle_ready(self):
         if not self._resume_after_swap and not self._identity_news:
@@ -1758,9 +1809,13 @@ class VirtualToolheads:
             p.buttons([("Looks right", ui_cmd("close"), "primary"),
                        ("Undo", ui_cmd("serial_forget_apply"), "secondary")])
             self._show(p)
-        else:
+        elif news["conflicts"]:
             lines += self._calibration_lines()
             self._ui_result("Toolheads detected", lines)
+        else:
+            # Expected outcome of a swap: a status message, no dialog.
+            self.trace_note("toolheads detected: status message")
+            self.gcode.respond_info("\n".join(lines))
         return True
 
     def _unknown_candidates(self, slot):
@@ -4111,19 +4166,14 @@ class Calibrator:
                 'flow': self.vt.flow_state(slot, lookup, st) is False}
 
     def _auto_open_state(self):
-        """What to do after a swap restart: None (nothing needs it), 'now'
-        (open the calibrate screen) or 'wait' (the only gap is the flow K
-        of a filament that is not identified yet)."""
-        needy = self._needy()
-        if not needy:
-            return None
-        for slot in needy:
+        """What to do after a swap restart: None (nothing to open) or 'now'
+        (open the calibrate screen).  A missing Dynamic Flow K alone never
+        opens it; the Calibrate button in the card header covers that."""
+        for slot in self._needy():
             n = self._needs(slot)
-            soft = n['flow'] and not n['ofs'] and not n['pid'] and \
-                not self.vt.flow_identified(slot)
-            if not soft:
+            if n['ofs'] or n['pid']:
                 return 'now'
-        return 'wait'
+        return None
 
     def _needy(self):
         return [slot for slot in range(self.store.n_slots)

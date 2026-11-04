@@ -1,76 +1,174 @@
-# Custom Snapmaker U1 Firmware
+# Snapmaker U1 Extended Firmware + QuickSwap Virtual Toolheads
 
-[![Latest Release](https://img.shields.io/github/v/release/paxx12/SnapmakerU1)](https://github.com/paxx12/SnapmakerU1/releases/latest)
-[![Pre-release](https://img.shields.io/github/v/release/paxx12/SnapmakerU1?include_prereleases&label=pre-release)](https://github.com/paxx12/SnapmakerU1/releases)
+An unofficial fork of [paxx12's Snapmaker U1 Extended Firmware](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware)
+that adds **virtual toolheads**: calibration, nozzle, PID and flow data that
+follow the *toolhead*, not the slot it happens to be plugged into.
 
-This project builds custom firmware for the Snapmaker U1 3D printer,
-enabling debug features like SSH access and adding additional capabilities.
+> **Warning:** This is experimental, unofficial firmware. It is not affiliated
+> with or endorsed by Snapmaker or paxx12. Damage caused by custom firmware is
+> not covered by the Snapmaker warranty. Back up first, stay at the printer for
+> your first calibrations, and use it at your own risk.
 
-This is an independent project and is not affiliated with Snapmaker.
+## Why
 
-> **Warning**: While installing custom firmware does not automatically void the product warranty, any damage caused by or attributable to the installation or use of custom firmware is not covered under warranty. Use at your own risk. See [Snapmaker Terms of Use](https://www.snapmaker.com/terms-of-use) for details.
->
-> Custom firmware is intended for users with appropriate technical knowledge. Ensure you understand the implications before proceeding.
+On a stock U1 changing a nozzle, means taking a toolhead off the dock, opening 
+it up, removing multiple screws, unplugging and unrouting several small wiring 
+connections, then putting on the new nozzle, routing the wires back and closing
+it all up.  And even if you just replace one nozzle, doing so means 
+recalibrating all four toolheads, a process that involves staying at the printer, 
+scrubbing each one in turn, and finally removing the buildplate so it can run
+offset calibration.
+
+It's not hard, but a simple nozzle change could take 30 minutes or more of work 
+and baby-sitting.  And that's enough to make me not end up doing a print.
+
+With quickswap virtual toolheads, each physical toolhead is a named object that 
+remembers its own data, so you can keep spares, move toolheads between slots 
+and recalibrate only what changed, if anything.  If you want to invest a
+little money on spare toolheads, it can make replacing them a thirty
+second process per toolhead.  You replace the stock cables with generic
+24" USB-C cables and labelled strain-relief cuffs that keep your toolheads
+safe while making swaps quick and easy.
+
+![Replacing A Toolhead](overlays/mods/rando_calrissian/docs/images/quick_swap.mp4)
+
+![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_fluidd.jpg)
+
+## What it does
+
+- **Named toolheads** (`LA`, `RA`, `RB`, ... renamable) that store their nozzle
+  diameter, flow type, material and XYZ calibration. The four slots point at
+  whichever toolhead is loaded in them. Left Slot (T0) and Right Slot (T1-T3)
+  toolheads are different hardware and are never mixed up.
+- **Automatic swap detection.** Each toolhead board is recognised by its USB
+  serial number. Swap toolheads, restart, and the layout follows the hardware.
+  An unknown board asks whether it is new or replaces a toolhead.
+- **Swap Tool Wizard.** Pick the toolheads to take out, optionally unload their
+  filament, dock, power down or restart firmware, and you're good to go.
+- **Selective calibration.** Calibrate only the toolheads that need it, with
+  separate switches for offset, PID and Dynamic Flow. Each is on by default
+  when a selected toolhead lacks it.
+- **PID tunings per toolhead and temperature**, kept across nozzle changes
+  (shown as stale until recalibrated).
+- **Dynamic Flow (K) per toolhead and filament**, using the stock flow
+  calibration and keyed by the Spoolman filament, so changing spools does not
+  mean recalibrating.
+- **Backup and restore** of all toolhead data.
+- **Fluidd dashboard card** with one lane per slot, a Swap Tool button,
+  a Calibrate mode, and a Menu for nozzles, PID, boards and backups, all as
+  instant in-card panels. Other interfaces get the same functions through
+  dialogs (`VT_UI`).
+
+It is off by default and switched on in Firmware Config. Turning it off
+returns to stock behaviour with the toolheads that are currently loaded.
+
+![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_swap_menu.jpg)
+
+
+## Physical Hardware
+
+![Quick Swap Strain Relief Cuff](overlays/mods/rando_calrissian/docs/images/strain_relief_cuff_02.jpg)
+
+Download and print the Quick Swap Strain Relief Cuffs here :
+https://www.printables.com/model/1899319-snapmaker-u1-usb-c-quick-swap-strain-relief
+
+
+Pair these with USB-C cables rated for data and high power.  I use the following 
+USB-C cables with mine, but any 24"-26"  (~61-65 CM) USB-C cable should work well.
+https://www.amazon.com/dp/B0G51DD5ZX
+
 
 ## Download
 
-Get the latest pre-built firmware from [Releases](https://github.com/paxx12/SnapmakerU1/releases).
+Pre-built images are on the [Releases](../../releases) page. Each release lists
+the upstream commit it was built from and a SHA-256 checksum. Check the
+checksum before flashing.
+
+## Install
+
+The easiest way is the Extended Firmware web interface:
+
+1. Download `U1_virtual_toolheads.bin` from the [Releases](../../releases) page
+   and check it against the published SHA-256.
+2. Open `http://[your_snapmaker_u1]/firmware-config/` in a browser (use the
+   printer's IP address or hostname).
+3. In **Firmware Upgrade**, use **Upload File**: select or drag in the `.bin`
+   and click **Upload & Upgrade**. The printer installs it and reboots by
+   itself.
+4. Open the Firmware Configuration page again, enable **Virtual Toolheads** and
+   confirm. Klipper restarts.
+5. Run `VT_STATUS` in the console. Your four toolheads become `LA`, `RA`, `RB`
+   and `RC` with their existing calibration.
+
+**Alternative (USB):** copy the `.bin` to a FAT32 USB drive and use *Settings >
+About > Firmware Version > Local Update* on the printer. The full steps,
+including reverting to stock, are in [docs/install.md](docs/install.md).
 
 ## Documentation
 
-See [User Documentation](https://snapmakeru1-extended-firmware.pages.dev/) for features, installation instructions, and usage guides.
+- [Virtual toolheads user guide](overlays/mods/rando_calrissian/docs/virtual-toolheads.md):
+  how to use it, risks, and technical details.
+- [Module README](overlays/mods/rando_calrissian/01-virtual-toolheads/README.md)
+  and [changelog](overlays/mods/rando_calrissian/01-virtual-toolheads/CHANGELOG.md).
+- [Dashboard card](overlays/mods/rando_calrissian/02-virtual-toolheads-card/README.md).
 
-## Building from Source
+## Status and known limits
 
-**Source repositories:**
-- GitHub: [https://github.com/paxx12](https://github.com/paxx12)
-- Codeberg: [https://codeberg.org/paxx12-snapmaker-u1](https://codeberg.org/paxx12-snapmaker-u1)
+- The Virtual Toolheads is a Mod and relies on Fluidd for its web interface.
+- While it doesn't actively change the default firmware, there are cases where
+  it blocks certain actions to allow for single tool calibration or hot swap
+  of USB cables.  These will result in on-screen errors.
+- Developed and tested on the author's U1. The module has 377 automated tests
+  and the card 83. The newest features have had the least time on a real
+  printer, so please report anything odd.
+- Only Fluidd gets the dashboard card. Mainsail and other interfaces use the
+  macro buttons and dialogs.
+- The firmware cannot tell which kind of slot a spare toolhead fits; it relies
+  on what you tell it.
+- Always update the layout after swapping toolheads. Automatic detection
+  happens on restart (either via power cycle or the restart firmware button).
+- Calibration data is kept in `persistent/virtual_toolheads.json`; the stock
+  files are regenerated from it, so editing them by hand has no lasting effect
+  while the feature is on.
+- Do not use USB-C Cables without the linked strain relief cuffs or alternative.
+  Doing so will likely cause damage to your toolhead and printer ports over time.
+- Powering down to replace toolheads is recommended.  I hot swap mine 
+  and have not run into issues, but do so at your own risk.
 
-See [Building from Source](docs/development.md) for instructions on building custom firmware using Docker.
+## Building from source
 
-## Dependent projects
+The virtual toolheads mod lives in
+[`overlays/mods/rando_calrissian/`](overlays/mods/rando_calrissian). Build as
+described in [docs/development.md](docs/development.md) with the mod added to
+the profile:
 
-- [v4l2-mpp](https://github.com/paxx12/v4l2-mpp) - Hardware-accelerated camera stack with WebRTC streaming, V4L2 controls, and settings persistence
-- [screen-apps](https://github.com/paxx12/screen-apps) - U1 touchscreen applications and UI components
-- [prometheus-klipper-exporter](https://github.com/scross01/prometheus-klipper-exporter) - Prometheus metrics exporter for Klipper
-- [snapmaker-u1-timelapse-recovery](https://github.com/horzadome/snapmaker-u1-timelapse-recovery) - Tool to recover corrupted timelapse videos
-- [rockchip-linux/kernel](https://github.com/rockchip-linux/kernel) - Rockchip kernel source for building additional kernel modules
+```bash
+./dev.sh make build PROFILE=extended-rando_calrissian OUTPUT_FILE=firmware/U1_virtual_toolheads.bin
+```
 
-## Community
+The module tests run with `python3 test/test_virtual_toolheads.py` from the
+`01-virtual-toolheads` folder; the card tests need Playwright and Chromium.
 
-Join the [Snapmaker Discord](https://discord.com/invite/snapmaker-official-1086575708903571536) and visit the **#u1-printer** channel to connect with other users using the custom firmware, share experiences, and get help.
+## Staying in step with upstream
+
+This branch is based on upstream's `develop`. Upstream changes are merged in
+periodically; see the release notes for the commit each build is based on.
+
+## Credits and license
+
+All of the base firmware is the work of
+[paxx12](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware)
+and its contributors, built on Snapmaker's U1 Klipper. The virtual toolheads
+mod is by [rando-calrissian](https://github.com/rando-calrissian). Everything
+here is under the same license as upstream, GPL-3.0; see [LICENSE](LICENSE).
 
 ## Issues
 
-For bug reports, please validate the issue against Stock Firmware first before creating a bug report. This helps determine if the issue is specific to the custom firmware or exists in the stock firmware as well.
+Please check an issue against the stock firmware and against upstream's Extended
+Firmware first. Problems with the virtual toolheads mod can be reported in this
+repository's issues; include the firmware build, what you did, and the
+relevant console or `klippy.log` lines. Do not post your saved calibration
+files.
 
-This repository does not accept feature requests or support issues in general. Pull Requests are the desired way to propose new changes and may be accepted after review.
-
-## Contact
-
-For inquiries about the firmware, contact: paxx12dev@gmail.com
-
-## Support
-
-If you find this project useful and would like to support its development:
-
-[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/paxx12)
-
-🖨️ **Buy a Snapmaker U1** — ordering via the link below supports this project. Optionally use code `PAXX12CUSTOM` for $20 off, or any other discount you find online:
-
-  * EU store: [https://snapmaker-eu.myshopify.com?ref=paxx12](https://snapmaker-eu.myshopify.com?ref=paxx12)
-  * US store: [https://snapmaker-us.myshopify.com?ref=paxx12](https://snapmaker-us.myshopify.com?ref=paxx12)
-  * Global store: [https://test-snapmaker.myshopify.com?ref=paxx12](https://test-snapmaker.myshopify.com?ref=paxx12)
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for information about contributing to this project.
-
-See [HEROES.md](HEROES.md) for contributors who made significant contributions to each release.
-
-## License
-
-The main project is licensed under the GNU General Public License v3.0
-(GPL-3.0). See [LICENSE](LICENSE) for details.
-
-For licensing information about individual tools and dependencies, see their respective directories.
+For everything else about the base firmware, see the upstream
+[README](https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware#readme).

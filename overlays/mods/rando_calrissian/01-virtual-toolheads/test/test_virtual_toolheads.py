@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
-# SPDX-FileCopyrightText: Copyright (c) 2026 @rando-calrissian
+# SPDX-FileCopyrightText: Copyright (c) 2026 @YOUR-GITHUB-USERNAME
 
 # Run with: python3 test/test_virtual_toolheads.py
 import json
@@ -394,6 +394,10 @@ class FakeGcode:
 
     def respond_raw(self, msg):
         self.raw.append(msg)
+
+    def respond_info(self, msg, log=True):
+        for line in msg.split("\n"):
+            self.raw.append("// " + line)
 
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
@@ -1105,12 +1109,12 @@ class UiTests(unittest.TestCase):
         rx.run(vt.FILAMENT_ID_WAIT + 2)
         self.assertNotIn("VT_CAL PAGE=prep", "\n".join(p.gcode.take_prompt()))
 
-    def test_filament_identified_in_time_with_the_k_missing_opens_the_screen(self):
+    def test_flow_gap_alone_never_opens_the_screen(self):
         p, rx, state = self.flow_only_restart()
         p.gcode.take_prompt()
         state["ident"] = True            # identified, and its K is still missing
         rx.run(vt.FILAMENT_ID_POLL + 0.1)
-        self.assertIn("VT_CAL PAGE=prep", "\n".join(p.gcode.take_prompt()))
+        self.assertNotIn("VT_CAL PAGE=prep", "\n".join(p.gcode.take_prompt()))
 
     def test_filament_identified_with_the_k_found_opens_nothing(self):
         p, rx, state = self.flow_only_restart()
@@ -4379,6 +4383,37 @@ class BoardModuleTests(BoardFixture):
         self.assertTrue(all(self.mod.store.serial(i) is None
                             for i in self.mod.store.ids()))
 
+    def lose_mcu(self, name):
+        self.p.get_state_message = lambda: (
+            "Lost communication with MCU '%s'" % name, "")
+        self.p.send_event("klippy:shutdown")
+
+    def test_lost_toolhead_mcu_offers_a_restart(self):
+        self.settled()
+        self.boot()
+        self.p.gcode.take_prompt()
+        self.lose_mcu("e2")
+        text = self.prompt()
+        self.assertIn("Lost communication with MCU 'e2'", text)
+        self.assertIn("hot-swap", text)
+        self.assertIn("Restart firmware|VT_RESTART", text)
+
+    def test_lost_mcu_during_a_started_swap_adds_no_dialog(self):
+        self.settled()
+        self.boot()
+        self.p.gcode.take_prompt()
+        self.mod._mark_swap_pending()
+        self.lose_mcu("e2")
+        self.assertEqual(self.p.gcode.take_prompt(), [])
+
+    def test_other_shutdowns_add_no_dialog(self):
+        self.settled()
+        self.boot()
+        self.p.gcode.take_prompt()
+        self.p.get_state_message = lambda: ("Heater extruder not heating", "")
+        self.p.send_event("klippy:shutdown")
+        self.assertEqual(self.p.gcode.take_prompt(), [])
+
     def test_a_restart_with_nothing_changed_shows_nothing(self):
         self.settled()
         self.boot()
@@ -4391,9 +4426,10 @@ class BoardModuleTests(BoardFixture):
         self.assertEqual([mod.store.label(i) for i in mod.store.layout],
                          ["LA", "RB", "RA", "RC"])
         text = self.prompt()
-        self.assertIn("Toolheads detected", text)
-        self.assertIn("T1: RA -> RB", text)
-        self.assertIn("T2: RB -> RA", text)
+        # a status message in the console, not a dialog
+        self.assertNotIn("prompt_begin", text)
+        self.assertIn("// T1: RA -> RB", text)
+        self.assertIn("// T2: RB -> RA", text)
         # the offsets follow the toolheads: slot 1 now carries RB's
         self.assertEqual(list(self.exts[1].base_position), BP[2])
 
