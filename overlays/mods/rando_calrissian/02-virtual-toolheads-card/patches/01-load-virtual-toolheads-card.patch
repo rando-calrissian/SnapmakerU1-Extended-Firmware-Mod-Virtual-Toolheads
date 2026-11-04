@@ -1,0 +1,7 @@
+--- rootfs.original/home/lava/fluidd/index.html
++++ rootfs/home/lava/fluidd/index.html
+@@ -55,3 +55,4 @@
+     <!-- built files will be auto injected -->
++    <script defer src="/virtual-toolheads-card.js"></script>
+   </body>
+ </html>

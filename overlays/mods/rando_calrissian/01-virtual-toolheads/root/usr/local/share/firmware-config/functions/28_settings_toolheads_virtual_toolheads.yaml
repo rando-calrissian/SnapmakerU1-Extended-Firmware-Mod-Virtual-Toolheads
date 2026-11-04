@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
+# SPDX-FileCopyrightText: Copyright (c) 2026 @rando-calrissian
+
+settings:
+  toolheads:
+    items:
+      virtual_toolheads:
+        label: Virtual Toolheads
+        description: Keeps calibration and nozzle data with each physical toolhead instead of the slot it sits in, so toolheads can be swapped without recalibrating. Manage them with the VT_* commands (start with VT_STATUS).
+        get_cmd:
+          - bash
+          - -c
+          - test -f /oem/printer_data/config/extended/klipper/virtual_toolheads.cfg && echo "enabled" || echo "disabled"
+        options:
+          enabled:
+            label: Enabled
+            confirm: "Enable virtual toolheads? Klipper will restart. The current four toolheads become A-D with their existing calibration."
+            cmd:
+              - bash
+              - -xc
+              - |
+                test -r /usr/local/share/firmware-config/tweaks/klipper/virtual_toolheads.cfg || { echo "ERROR: virtual_toolheads.cfg is missing from this firmware"; exit 1; } &&
+                mkdir -p /oem/printer_data/config/extended/klipper &&
+                ln -sf /usr/local/share/firmware-config/tweaks/klipper/virtual_toolheads.cfg /oem/printer_data/config/extended/klipper/virtual_toolheads.cfg &&
+                echo "Virtual toolheads enabled. Restarting Klipper..." &&
+                /etc/init.d/S60klipper restart
+          disabled:
+            label: Disabled
+            cmd:
+              - bash
+              - -xc
+              - |
+                rm -f /oem/printer_data/config/extended/klipper/virtual_toolheads.cfg &&
+                echo "Virtual toolheads disabled. Restarting Klipper..." &&
+                /etc/init.d/S60klipper restart
+        default: disabled
