@@ -30,7 +30,7 @@ second process per toolhead.  You replace the stock cables with generic
 24" USB-C cables and labelled strain-relief cuffs that keep your toolheads
 safe while making swaps quick and easy.
 
-![Replacing A Toolhead](overlays/mods/rando_calrissian/docs/images/quick_swap.mp4)
+![Replacing A Toolhead](overlays/mods/rando_calrissian/docs/images/quick_swap.webm)
 
 ![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_fluidd.png)
 
