@@ -32,7 +32,7 @@ safe while making swaps quick and easy.
 
 ![Replacing A Toolhead](overlays/mods/rando_calrissian/docs/images/quick_swap.mp4)
 
-![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_fluidd.jpg)
+![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_fluidd.png)
 
 ## What it does
 
@@ -62,7 +62,7 @@ safe while making swaps quick and easy.
 It is off by default and switched on in Firmware Config. Turning it off
 returns to stock behaviour with the toolheads that are currently loaded.
 
-![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_swap_menu.jpg)
+![Virtual Toolheads Fluidd Interface](overlays/mods/rando_calrissian/docs/images/virtual_toolheads_swap_menu.png)
 
 
 ## Physical Hardware
