@@ -129,6 +129,16 @@ including reverting to stock, are in [docs/install.md](docs/install.md).
   and [changelog](overlays/mods/rando_calrissian/01-virtual-toolheads/CHANGELOG.md).
 - [Dashboard card](overlays/mods/rando_calrissian/02-virtual-toolheads-card/README.md).
 
+## Precautions
+- Don't run this with bare USB-C Cables.  The standard screw on cables are
+  there to protect the USB-C ports from strain.  The 3D Printed parts provided here
+  are designed to do the same job.  As with all modifications of this type, you do
+  this at your own risk!
+- Be careful when swapping out toolheads that have just been used or unloaded filament.
+  The nozzle will still be hot, so don't touch it or place it near anything that could
+  be damaged by a hot nozzle until it has fully cooled.
+- If you suspect anything has drifted on a toolhead, calibration is your friend!
+
 ## Status and known limits
 
 - The Virtual Toolheads is a Mod and relies on Fluidd for its web interface.
