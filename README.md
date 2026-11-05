@@ -78,10 +78,15 @@ returns to stock behaviour with the toolheads that are currently loaded.
 
 
 
-## Physical Hardware
+## Physical Hardware Requirements
 
-Download and print the Quick Swap Strain Relief Cuffs here :
+**_DO NOT USE THIS MOD WITHOUT THIS PART FOR YOUR USB-C PORTS_**
+
+Download and print the Quick Swap Strain Relief Cuffs here 
 https://www.printables.com/model/1899319-snapmaker-u1-usb-c-quick-swap-strain-relief
+There are labelled ones for each toolhead and blanks for the ports on the U1.  Keep both sides safe!
+
+<img src="overlays/mods/rando_calrissian/docs/images/strain_relief_cuff_03.jpg" width="320" alt="Quick Swap Strain Relief Cuff">
 
 Pair these with USB-C cables rated for data and high power.  I use the following 
 USB-C cables with mine, but any 24"-26"  (~61-65 CM) USB-C cable should work well.
