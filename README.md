@@ -32,7 +32,7 @@ and recalibrate only what changed, if anything.
 
 The workflow is streamlined, so select which heads you want to swap and it 
 automatically unloads the filament if necessary, docks the toolheads, and 
-auto-detects the new toolheads and sets nozzle type, PID, and offset for you.  
+auto-detects the new toolheads, sets nozzle type, PID, and offset for you.  
 If anything isn't in calibration, it allows you to just calibrate only the 
 toolheads that lack calibration.
 
@@ -129,7 +129,7 @@ including reverting to stock, are in [docs/install.md](docs/install.md).
 - The Virtual Toolheads is a Mod and relies on Fluidd for its web interface.
 - While it doesn't actively change the default firmware, there are cases where
   it blocks certain actions to allow for single tool calibration or hot swap
-  of USB cables.  These will result in on-screen errors.
+  of USB cables.  These will result in on-screen errors that are benign.
 - Developed and tested on the author's U1. The module has 377 automated tests
   and the card 83. The newest features have had the least time on a real
   printer, so please report anything odd.
