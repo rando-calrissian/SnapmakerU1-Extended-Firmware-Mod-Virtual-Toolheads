@@ -95,6 +95,13 @@ https://www.amazon.com/dp/B0G51DD5ZX
 <img src="overlays/mods/rando_calrissian/docs/images/strain_relief_cuff_02.jpg" width="320" alt="Quick Swap Strain Relief Cuff">
 
 
+A user on Reddit pointed out this alternative top cap which uses the original
+USB-C cables and fits over the whole top.  While I have not personally used it,
+it seems like it should be capable of achieving the same job and you don't have
+to buy any additional cables.
+https://makerworld.com/en/models/3233313-snapmaker-u1-quick-change-self-locking-upper-cover#profileId-3662437
+
+
 ## Download
 
 Pre-built images are on the [Releases](../../releases) page. Each release lists
