@@ -88,6 +88,11 @@ There are labelled ones for each toolhead and blanks for the ports on the U1.  K
 
 <img src="overlays/mods/rando_calrissian/docs/images/strain_relief_cuff_03.jpg" width="320" alt="Quick Swap Strain Relief Cuff">
 
+The screws used on the toolheads (st2.6x10) can be a bit hard to source.  If you're
+picking up toolheads from Snapmaker, also getting a screw set from them will cover all
+your bases here :  
+https://us.snapmaker.com/products/screw-set-for-snapmaker-u1?_pos=1&_psq=screw&_psid=05c24b14b&_ss=e
+
 Pair these with USB-C cables rated for data and high power.  I use the following 
 USB-C cables with mine, but any 24"-26"  (~61-65 CM) USB-C cable should work well.
 https://www.amazon.com/dp/B0G51DD5ZX
