@@ -60,11 +60,12 @@ filament of the picked slots is unloaded, the toolhead that is picked up is
 docked, and a *Restart firmware* button waits. The note says to power off and swap
 the toolheads (swapping without powering down is possible, at your own risk);
 then power on or click *Restart firmware*. After the restart the layout follows the hardware and the
-*Calibrate* screen opens by itself if anything needs it (otherwise a dialog
-lists what was detected). With *Unload filament* off it only docks. In the Fluidd card, a slot's
+*Calibrate* screen opens by itself if an offset or PID is missing (what was
+detected is a console message, not a dialog). With *Unload filament* off it only docks.
+**Load filament after** (off by default, independent of Unload; the card remembers it) loads filament in the picked slots after the restart (stock `AUTO_FEEDING EXTRUDER=n LOAD=1`, one slot after another, with a status screen and a console message at the end). If a calibration is offered the load waits until it finishes or is cancelled, because PID tuning has to start from a cold nozzle. Slots without filament waiting or already loaded are skipped, nothing is loaded during a print, and a dialog that needs your attention (an unknown board) drops the load with a message. In the Fluidd card, a slot's
 **Swap Tool** button is a toggle: it marks that toolhead for taking out and
 opens a small panel inside the card (below the lanes) with *Unload filament*,
-*Continue* and *Cancel*. Press Swap Tool on other lanes to add them (or again
+*Load filament after*, *Continue* and *Cancel*. Press Swap Tool on other lanes to add them (or again
 to remove one; removing the last closes the panel). *Cancel* clears every
 toggle. It all changes instantly in the browser; only *Continue* sends a command. When the swap has run, the card
 shows the result and a *Restart firmware* button. The panel closes by itself if
@@ -166,6 +167,28 @@ it or press Esc. The wizard therefore treats its screens in two ways:
   being shown is therefore ignored and the dialog is shown again. Other dialogs (menus,
   forms, results) are closed normally when dismissed.
 
+#### Offsets are relative to T0
+
+Every offset calibration measures the toolheads in the frame set by the
+homing before it, and that frame differs a little from session to session
+(typically tens of um in Z; Y moves with bed temperature). The stock firmware
+stores the difference to T0, so values from different sessions cannot be
+mixed. To allow recalibrating a single toolhead, the wizard measures T0 in
+every offset calibration and stores the other toolheads relative to the stored
+T0; the others stay valid. `VT_CALIBRATION_LOOPS REF=0` turns this off (the
+result is then stored as measured, with a warning).
+
+After changing T0's nozzle, run `VT_REPLACE_NOZZLE` for it and calibrate T0
+together with a toolhead that was not touched: the other toolheads are moved
+by the change of T0 and stay valid.
+
+T0 is never calibrated on its own, because on its own it only shows the
+session's frame. If you select only T0, the wizard adds the lowest-numbered
+toolhead that has a valid calibration and says so on the start prompt. If no
+other toolhead is calibrated yet, or `REF=0` is set, it warns before starting
+that the other toolheads cannot be corrected for a change of T0 and have to be
+recalibrated.
+
 ### PID tuning
 
 PID tuning is stored per toolhead, like the nozzle and the base position, and
@@ -240,6 +263,23 @@ filament, and swapping back and forth between filaments restores the right one.
 - Options in `[virtual_toolheads]`: `flow_filament_lookup` (`True`; `False`
   keeps spool ids and never contacts Spoolman) and `moonraker_url`
   (`http://127.0.0.1:7125`).
+
+### Calibration log (run-to-run variation)
+
+Every calibration run is appended to `persistent/virtual_toolheads_calibration_log.jsonl`:
+the raw offset probe result (X, Y, Z), the PID tuning (Kp, Ki, Kd and target
+temperature) and the Dynamic Flow K with its filament, together with the
+toolhead, slot and nozzle. Unlike the toolhead store, which ignores a repeat
+that gives the same value, the log keeps every run. `VT_CAL_LOG` prints the
+number of runs and the mean, standard deviation and range per toolhead and
+kind; `VT_CAL_LOG ACTION=SHOW [COUNT=30]` lists the latest runs, `TOOLHEAD=`
+and `KIND=offset|pid|flow` filter, and `ACTION=CLEAR` empties the log. `ACTION=SLOTS` breaks the offset runs down per toolhead and slot: the noise inside a session, the spread between sessions, the drift per run (in um) and the shift between slots as a multiple of the scatter. Offset runs also record the loop number, the loop count and whether the toolhead was docked between probes (`VT_CALIBRATION_LOOPS`). They also record a `home` entry with what the last Z homing (`G28`) printed (`z_offset`, `z_overshoot_comp`, `z_mesh_complete`), the tool that was active and its Z offset, the bed temperature, and the time of that homing (`home.t`). The Z of an offset run is measured in the frame that homing set, so group runs by `home.t` to tell a shift of that frame from a shift of the toolhead. It is
+for judging how repeatable the calibrations are before deciding whether
+averaging several runs is worth it. Runs that Klipper reports as aborted or
+that fell back to the filament default are left out of the statistics. The
+file is rotated at 512 KB (the older half becomes `.1`).
+
+The offset calibration can probe each toolhead several times in a row, without repeating the cleaning steps: `VT_CALIBRATION_LOOPS N=5` sets the number of probes (1 is normal, up to 20; `VT_CALIBRATION_LOOPS` alone shows it, and it resets on a Klipper restart). Klipper needs the `N=` form; a bare number is rejected by Klipper itself. The setting applies to every way of starting the calibration (the card, the dialogs and `VT_CALIBRATE`). `VT_CALIBRATION_LOOPS N=5 DOCK=1` also docks the toolhead (`PARK_EXTRUDER`) before each repeat, so the probe command picks it up again and the pick-up is part of what you compare; a new `N=` without `DOCK=1` switches it off again. `CLEAN=0` (also console only) skips the heating, automatic cleaning and the wipe prompt, for repeat runs when no filament has run since the last cleaning; homing, preheating, the cool-down to probe temperature and the build plate check still run (homing needs the plate on, so put it on for the start, then remove it when asked). The runs are logged as not cleaned. Every probe is logged, the last result is saved, and a failure in a repeat stops only the repeats and is mentioned on the result screen.
 
 ### Toolhead boards (automatic swap detection)
 

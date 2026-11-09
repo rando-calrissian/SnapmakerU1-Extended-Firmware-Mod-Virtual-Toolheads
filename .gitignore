@@ -9,3 +9,4 @@ tools/rk2918_tools/img_unpack
 tools/rk2918_tools/mkkrnlimg
 _site/
 __pycache__/
+Claude outputs/

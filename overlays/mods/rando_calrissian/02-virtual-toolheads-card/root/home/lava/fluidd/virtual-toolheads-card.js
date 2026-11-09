@@ -20,6 +20,8 @@
 
   function lsGet() { try { return localStorage.getItem(LS_KEY) === '1'; } catch (e) { return false; } }
   function autoGet() { try { return localStorage.getItem('vtAutoCal') || ''; } catch (e) { return ''; } }
+  function loadGet() { try { return localStorage.getItem('vtSwapLoad') === '1' ? 1 : 0; } catch (e) { return 0; } }
+  function loadSet(v) { try { localStorage.setItem('vtSwapLoad', v ? '1' : '0'); } catch (e) {} }
   function autoSet(v) { try { localStorage.setItem('vtAutoCal', String(v)); } catch (e) {} }
   function lsSet(v) { try { localStorage.setItem(LS_KEY, v ? '1' : '0'); } catch (e) {} }
   var HIDE_KEY = 'vt-card-hidden';
@@ -703,11 +705,16 @@
     });
     un.classList.add('vt-swap-unload'); if (sw.unload) un.classList.add('vt-on');
     un.setAttribute('aria-pressed', sw.unload ? 'true' : 'false');
-    var row2 = el('div', 'vt-swap-row'); row2.appendChild(un); box.appendChild(row2);
-    box.appendChild(el('div', 'vt-notice-line', (sw.unload ? 'Filament loaded on the picked toolheads is unloaded. ' : '') + 'The toolhead that is picked up is docked.'));
+    var ld = btn(tpl.btn, 'Load filament after: ' + (sw.load ? 'on' : 'off'), !canAct, function () {
+      sw.load = sw.load ? 0 : 1; loadSet(sw.load); render();
+    });
+    ld.classList.add('vt-swap-load'); if (sw.load) ld.classList.add('vt-on');
+    ld.setAttribute('aria-pressed', sw.load ? 'true' : 'false');
+    var row2 = el('div', 'vt-swap-row'); row2.appendChild(un); row2.appendChild(ld); box.appendChild(row2);
+    box.appendChild(el('div', 'vt-notice-line', (sw.unload ? 'Filament loaded on the picked toolheads is unloaded. ' : '') + (sw.load ? 'After the restart (and any calibration) filament is loaded in these slots. ' : '') + 'The toolhead that is picked up is docked.'));
     var acts = el('div', 'vt-swap-row');
     var go = btn(tpl.btn, 'Continue', !canAct || !sw.sel.length, function () {
-      var cmd = 'VT_UI PAGE=swap_apply SEL=' + sw.sel.join(',') + ' UNLOAD=' + sw.unload;
+      var cmd = 'VT_UI PAGE=swap_apply SEL=' + sw.sel.join(',') + ' UNLOAD=' + sw.unload + ' LOAD=' + (sw.load ? 1 : 0);
       state.swap = null; render(); send(cmd);
     });
     go.classList.add('vt-swap-go');
@@ -835,14 +842,16 @@
       if (th.pid.calibrated && th.pid.at) pe.title = 'Tuned ' + th.pid.at + (th.pid.source ? ' (' + th.pid.source + ')' : '');
       kv.appendChild(pe);
     }
-    /* Dynamic flow (K) of the filament in the lane; nothing for a toolhead
-     * that is not loaded or has no filament. */
+    /* Dynamic flow (K) of the filament in the lane; "No Filament Loaded"
+     * for a toolhead without filament. */
     if (th.flow && th.flow.filament) {
       var fk = th.flow.k != null;
       var fe = el('div', 'vt-flow ' + (fk ? 'vt-ok' : 'vt-dim'),
         fk ? 'Dynamic Flow K ' + Number(th.flow.k).toFixed(3) : 'Dynamic Flow not calibrated');
       fe.title = 'Filament ' + th.flow.filament;
       kv.appendChild(fe);
+    } else if (th.flow) {
+      kv.appendChild(el('div', 'vt-flow vt-dim', 'No Filament Loaded'));
     }
     ln.appendChild(kv);
     var bs = el('div', 'vt-btns');
@@ -858,7 +867,7 @@
         /* The toolhead boards identify themselves: the button toggles this
          * toolhead for taking out; nothing is sent until Continue. */
         state.menu = null;
-        if (!state.swap) state.swap = { sel: [slot], unload: 1 };
+        if (!state.swap) state.swap = { sel: [slot], unload: 1, load: loadGet() };
         else {
           var i = state.swap.sel.indexOf(slot);
           if (i >= 0) state.swap.sel.splice(i, 1); else { state.swap.sel.push(slot); state.swap.sel.sort(); }

@@ -137,11 +137,12 @@ class RenderingTests(Base):
         self.assertEqual(pg.locator('.vt-lane[data-slot="0"] .vt-flow.vt-ok').count(), 1)
         self.assertIn('Dynamic Flow not calibrated', pg.locator('.vt-lane[data-slot="1"]').inner_text())
         self.assertEqual(pg.locator('.vt-lane[data-slot="1"] .vt-flow.vt-dim').count(), 1)
-        # no filament / older module: no flow line
+        # older module (no flow data): no flow line
         self.assertEqual(pg.locator('.vt-lane[data-slot="2"] .vt-flow').count(), 0)
         st = vt_status(); st['toolheads']['RB']['flow'] = {'count': 0, 'filament': None, 'k': None}
         pg2 = self.open(Mock(status=st)); pg2.wait_for_selector('.vt-lane')
-        self.assertEqual(pg2.locator('.vt-lane[data-slot="2"] .vt-flow').count(), 0)
+        self.assertEqual(pg2.locator('.vt-lane[data-slot="2"] .vt-flow').count(), 1)
+        self.assertIn('No Filament Loaded', pg2.locator('.vt-lane[data-slot="2"]').inner_text())
     def test_status_notice(self):
         m = Mock(); pg = self.open(m); pg.wait_for_selector('.vt-lane')
         self.assertEqual(pg.locator('.vt-notice').count(), 0)
@@ -223,9 +224,24 @@ class RenderingTests(Base):
         for _ in range(20):
             if m.sent: break
             pg.wait_for_timeout(100)
-        self.assertEqual(m.sent, ['VT_UI PAGE=swap_apply SEL=1,3 UNLOAD=0'])
+        self.assertEqual(m.sent, ['VT_UI PAGE=swap_apply SEL=1,3 UNLOAD=0 LOAD=0'])
         self.assertEqual(pg.locator('.vt-swap').count(), 0)
         self.assertEqual(pg.locator('.vt-change.vt-on').count(), 0)
+    def test_load_filament_after_toggle_is_sent_and_remembered(self):
+        m = Mock(status=self.boards_status()); pg = self.open(m); pg.wait_for_selector('.vt-lane')
+        pg.locator('.vt-change').nth(2).click(); pg.wait_for_selector('.vt-swap')
+        self.assertIn('off', pg.locator('.vt-swap-load').inner_text())
+        pg.locator('.vt-swap-load').click()
+        self.assertIn('on', pg.locator('.vt-swap-load').inner_text())
+        pg.locator('.vt-swap-go').click()
+        for _ in range(20):
+            if m.sent: break
+            pg.wait_for_timeout(100)
+        self.assertEqual(m.sent, ['VT_UI PAGE=swap_apply SEL=2 UNLOAD=1 LOAD=1'])
+        # the choice is remembered for the next swap
+        pg.wait_for_selector('.vt-lane')
+        pg.locator('.vt-change').nth(1).click(); pg.wait_for_selector('.vt-swap')
+        self.assertIn('on', pg.locator('.vt-swap-load').inner_text())
     def test_untoggling_the_last_button_closes_the_panel_and_cancel_clears_all(self):
         m = Mock(status=self.boards_status()); pg = self.open(m); pg.wait_for_selector('.vt-lane')
         pg.locator('.vt-change').nth(0).click(); pg.wait_for_selector('.vt-swap')

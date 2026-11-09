@@ -24,6 +24,7 @@
 #  - A toolhead without valid calibration is loaded into its slot with
 #    base_position = None, exactly like a never-calibrated stock slot.
 
+import calendar
 import collections
 import copy
 import json
@@ -38,13 +39,15 @@ import urllib.request
 
 # Release version of this mod as a whole (see CHANGELOG.md). The store has its
 # own SCHEMA_VERSION, which only changes when the file format does.
-VERSION = "0.6"
+VERSION = "0.7"
 SCHEMA_VERSION = 6
 MCU_NAME_FMT = "mcu e%d"     # [mcu e0] .. [mcu e3] of the toolheads
 SYSFS_TTY = "/sys/class/tty"
 MAX_BACKUPS = 20            # oldest are deleted beyond this
 BACKUP_RE = re.compile(r"^vt-\d{8}-\d{6}(-[a-z0-9]+)*\.json$")
 STORE_FILENAME = "virtual_toolheads.json"
+CAL_LOG_FILENAME = "virtual_toolheads_calibration_log.jsonl"
+CAL_LOG_MAX = 512 * 1024      # bytes; the older half moves to ".1"
 STOCK_VIEW_FILENAME = "extruder_base_position.json"
 OFFSET_EVENT = "probe_inductance_coil: update_extruder_offset"
 
@@ -83,6 +86,13 @@ STALE_DISMISS = 1.5         # a dismissal this soon after a dialog is stale
 # Channel states of the stock filament feeder (filament_feed.py)
 FEED_LOADED = 'load_finish'
 FEED_NOT_LOADED = ('unload_finish', 'preload_finish', 'wait_insert')
+# Lines the stock Z homing prints (G28), kept with each offset run.
+HOME_LINES = (("z offset:", "z_offset"),
+              ("z_overshoot_comp:", "z_overshoot_comp"),
+              ("z_mesh_complete:", "z_mesh_complete"))
+# Readable names for the stock feeder states shown to the user.
+FEED_STATE_TEXT = {'preload_finish': 'Filament Preloaded',
+                   'wait_insert': 'None Loaded'}
 FEED_UNLOADING = ('unload_prepare', 'unload_homing', 'unload_picking',
                   'unload_heating', 'unload_heat_finish', 'unload_doing')
 FEED_BUSY = ('preload_prepare', 'preload_feeding', 'load_prepare',
@@ -633,7 +643,24 @@ class VirtualToolheadStore:
         for th_id in self.data["toolheads"]:
             self.invalidate(th_id, reason)
 
-    def record_calibration(self, th_id, pos, slot, now=None):
+    def stored_base(self, th_id):
+        """The stored base_position, valid or not (None if never measured)."""
+        bp = self.data["toolheads"][th_id]["calibration"]["base_position"]
+        return list(bp) if bp is not None else None
+
+    def differs(self, th_id, pos):
+        old = self.data["toolheads"][th_id]["calibration"]["base_position"]
+        return not (old is not None and len(old) == 3 and
+                    all(abs(a - float(b)) <= POS_TOL
+                        for a, b in zip(old, pos[:3])))
+
+    def rebase(self, th_id, pos):
+        """Move a stored calibration into another frame; it stays valid."""
+        c = self.data["toolheads"][th_id]["calibration"]
+        c["base_position"] = [float(v) for v in pos[:3]]
+        c["anchored"] = True
+
+    def record_calibration(self, th_id, pos, slot, now=None, anchored=None):
         """Record a base_position seen in a slot.  Returns True if it is new
         (different from what is stored, or the stored one was invalid)."""
         c = self.data["toolheads"][th_id]["calibration"]
@@ -648,6 +675,9 @@ class VirtualToolheadStore:
         c["at"] = now or now_str()
         c["slot"] = slot
         c["epoch"] = self.data["epoch"]
+        # True: stored relative to T0 of the same session (frame-corrected);
+        # False: measured without T0, taken as it came; None: not known
+        c["anchored"] = anchored
         return True
 
     # ---- PID tuning ------------------------------------------------------
@@ -1114,6 +1144,12 @@ class VirtualToolheads:
         self._pid_events = {}        # slot -> PID_CALIBRATE results recorded
         self._pid_hooked = False
         self._flow_hooked = False
+        self._seen_results = {}      # stock slot name -> last raw result handled
+        self.frame_notes = []        # what the last calibration did about T0
+        self._home_hooked = False
+        self._home_depth = 0
+        self._home_seq = 0
+        self.last_home = None        # what the last Z homing (G28) reported
         self._flow_busy = False      # stock FLOW_CALIBRATE is running
         self._flow_outcome = {}      # slot -> result of the last FLOW_CALIBRATE
         self._flow_lookup = config.getboolean('flow_filament_lookup', True)
@@ -1132,6 +1168,8 @@ class VirtualToolheads:
         self.printer.register_event_handler(OFFSET_EVENT,
                                             self._handle_offset_event)
         self._resume_after_swap = False
+        self._pending_load = []      # slots to load filament in after a swap
+        self._identity_dialog = False
         self._detected = []          # board serial seen in each slot
         self._identity_news = None   # what the start-up identification found
         self._sticky = None
@@ -1207,6 +1245,15 @@ class VirtualToolheads:
                  "shutdown); used by the Restart firmware button")
         reg("VT_CARD", self.cmd_VT_CARD,
             desc="Used by the dashboard card to announce itself")
+        reg("VT_CALIBRATION_LOOPS", self.calibrator.cmd_VT_CALIBRATION_LOOPS,
+            desc="Probe each toolhead N times in a row during the offset "
+                 "calibration, from the menus too (N=1 is normal; DOCK=1 "
+                 "docks the toolhead between probes; CLEAN=0 skips the "
+                 "heating and cleaning steps; resets on restart)")
+        reg("VT_CAL_LOG", self.cmd_VT_CAL_LOG,
+            desc="Every calibration run is logged; show how much repeated "
+                 "runs vary ([TOOLHEAD=] [KIND=offset|pid|flow] "
+                 "[ACTION=SUMMARY|SLOTS|SHOW|CLEAR] [COUNT=])")
         reg("VT_TRACE", self.cmd_VT_TRACE,
             desc="Debug: trace every G-code command "
                  "(ACTION=ON [MINUTES=15] | OFF | DUMP [COUNT=60] | CLEAR)")
@@ -1249,6 +1296,253 @@ class VirtualToolheads:
     def _slots(self):
         return self.printer.lookup_object('extruder_list', [])
 
+    # ---- calibration run log ---------------------------------------------
+    def _cal_log_path(self):
+        return os.path.join(os.path.dirname(self._store_path()),
+                            CAL_LOG_FILENAME)
+
+    def log_calibration(self, kind, slot, **data):
+        """Append one calibration run to the log, whatever the store did with
+        it (the store ignores repeats; this log keeps them so the run-to-run
+        variation can be studied)."""
+        try:
+            if self.store is None:
+                return
+            th_id = self.store.toolhead_in_slot(slot)
+            ex = self._slots()[slot]
+            rec = {"t": now_str(), "kind": kind, "slot": slot,
+                   "toolhead": self.store.label(th_id), "id": th_id,
+                   "nozzle": getattr(ex, 'nozzle_diameter', None),
+                   "volume": getattr(ex, 'nozzle_volume_type', None)}
+            rec.update(data)
+            path = self._cal_log_path()
+            try:
+                if os.path.getsize(path) > CAL_LOG_MAX:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+        except Exception:
+            logging.exception("virtual_toolheads: could not log a "
+                              "calibration run")
+
+    def _read_cal_log(self):
+        rows = []
+        for path in (self._cal_log_path() + ".1", self._cal_log_path()):
+            try:
+                with open(path) as f:
+                    for line in f:
+                        try:
+                            rows.append(json.loads(line))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+        return rows
+
+    CAL_LOG_FIELDS = {"offset": ("x", "y", "z"),
+                      "pid": ("kp", "ki", "kd"),
+                      "flow": ("k",)}
+
+    @staticmethod
+    def _cal_group(r):
+        if r["kind"] == "pid":
+            return "%s %s @%s" % (r["toolhead"], "pid", r.get("target"))
+        if r["kind"] == "flow":
+            return "%s flow %s" % (r["toolhead"], r.get("key"))
+        return "%s offset" % r["toolhead"]
+
+    def cal_log_summary(self, rows):
+        """Lines: per toolhead/kind the number of runs and the spread."""
+        groups = collections.OrderedDict()
+        for r in rows:
+            if r.get("kind") == "flow" and r.get("outcome") in ("none", "default"):
+                continue
+            groups.setdefault(self._cal_group(r), []).append(r)
+        lines = []
+        for name, rs in groups.items():
+            kind = rs[0]["kind"]
+            parts = []
+            for fld in self.CAL_LOG_FIELDS[kind]:
+                vals = [r[fld] for r in rs if r.get(fld) is not None]
+                if not vals:
+                    continue
+                n = len(vals)
+                mean = sum(vals) / n
+                sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** .5 \
+                    if n > 1 else 0.
+                parts.append("%s mean %.4f sd %.4f range %.4f" % (
+                    fld, mean, sd, max(vals) - min(vals)))
+            slots = sorted({r["slot"] for r in rs if r.get("slot") is not None})
+            where = ""
+            if slots:
+                where = " (%s %s)" % ("slot" if len(slots) == 1 else "slots",
+                                      ", ".join("T%d" % v for v in slots))
+            lines.append("%s%s, %d run%s: %s" % (
+                name, where, len(rs), "" if len(rs) == 1 else "s",
+                "; ".join(parts)))
+        return lines
+
+    @staticmethod
+    def _epoch(t):
+        try:
+            return calendar.timegm(time.strptime(t, "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            return 0
+
+    def cal_log_blocks(self, rows):
+        """Offset runs grouped into sessions: consecutive runs of one toolhead
+        in one slot.  A new session starts at loop 1, after a gap of more than
+        10 minutes, or when the toolhead or slot changes."""
+        blocks = []
+        last = None
+        for r in rows:
+            if r.get("kind") != "offset":
+                continue
+            key = (r["toolhead"], r.get("slot"))
+            at = self._epoch(r.get("t"))
+            if last is None or key != last[0] or r.get("loop") == 1 \
+                    or at - last[1] > 600:
+                blocks.append((key, []))
+            blocks[-1][1].append(r)
+            last = (key, at)
+        return blocks
+
+    @staticmethod
+    def _sd(v):
+        if len(v) < 2:
+            return 0.
+        m = sum(v) / len(v)
+        return (sum((x - m) ** 2 for x in v) / (len(v) - 1)) ** .5
+
+    @staticmethod
+    def _slope(v):
+        n = len(v)
+        mi = (n - 1) / 2.
+        mv = sum(v) / n
+        den = sum((i - mi) ** 2 for i in range(n))
+        return sum((i - mi) * (x - mv) for i, x in enumerate(v)) / den
+
+    def cal_log_slot_report(self, rows):
+        """Per toolhead and slot: the noise inside a session, the spread
+        between sessions and the drift per run; then the shift between slots
+        measured against that noise."""
+        axes = ("x", "y", "z")
+        slots = collections.OrderedDict()
+        for key, rs in self.cal_log_blocks(rows):
+            slots.setdefault(key, []).append(rs)
+        stats = {}
+        lines = []
+        for (who, slot), blocks in sorted(slots.items(),
+                                          key=lambda kv: (kv[0][0],
+                                                          kv[0][1] or 0)):
+            n = sum(len(b) for b in blocks)
+            loops = sorted({"%s%s%s" % (
+                b[0].get("loops") or 1,
+                "+dock" if any(r.get("dock") for r in b) else "",
+                ", not cleaned" if b[0].get("cleaned") is False else "")
+                for b in blocks})
+            lines.append("%s slot T%s: %d runs in %d session%s (loops: %s)" % (
+                who, slot, n, len(blocks), "" if len(blocks) == 1 else "s",
+                ", ".join(loops)))
+            st = {}
+            for a in axes:
+                within = [b for b in blocks if len(b) > 1]
+                num = sum((len(b) - 1) * self._sd([r[a] for r in b]) ** 2
+                          for b in within)
+                den = sum(len(b) - 1 for b in within)
+                noise = (num / den) ** .5 if den else None
+                means = [sum(r[a] for r in b) / len(b) for b in blocks]
+                mean = sum(r[a] for b in blocks for r in b) / n
+                between = self._sd(means) if len(means) > 1 else None
+                slopes = [self._slope([r[a] for r in b]) for b in blocks
+                          if len(b) >= 3]
+                drift = sum(slopes) / len(slopes) if slopes else None
+                st[a] = (mean, noise, between, means)
+                lines.append(
+                    "  %s: mean %.4f, noise %s, between sessions %s, "
+                    "drift %s" % (
+                        a, mean,
+                        "n/a" if noise is None else "%.4f" % noise,
+                        "n/a" if between is None else "%.4f" % between,
+                        "n/a" if drift is None else
+                        "%+.1f um/run" % (drift * 1000)))
+            stats[(who, slot)] = st
+        by_who = collections.OrderedDict()
+        for (who, slot) in stats:
+            by_who.setdefault(who, []).append(slot)
+        for who, sl in by_who.items():
+            sl = sorted(s_ for s_ in sl if s_ is not None)
+            for other in sl[1:]:
+                ref = sl[0]
+                parts = []
+                for a in axes:
+                    d = stats[(who, other)][a][0] - stats[(who, ref)][a][0]
+                    # scatter of a slot: the larger of the noise inside a
+                    # session and the spread between sessions
+                    ns = []
+                    for k in (ref, other):
+                        _m, nz, bt, _ms = stats[(who, k)][a]
+                        if nz is not None or bt is not None:
+                            ns.append(max(nz or 0., bt or 0.))
+                    if ns:
+                        scatter = (sum(v * v for v in ns) / len(ns)) ** .5
+                        ratio = (" = %.1fx scatter" % (abs(d) / scatter)
+                                 if scatter > 0 else "")
+                    else:
+                        ratio = ""
+                    parts.append("%s %+.4f%s" % (a, d, ratio))
+                lines.append("%s slot shift T%d vs T%d: %s" % (
+                    who, other, ref, "; ".join(parts)))
+        return lines
+
+    def cmd_VT_CAL_LOG(self, gcmd):
+        action = gcmd.get('ACTION', 'SUMMARY').upper()
+        if action == 'CLEAR':
+            for path in (self._cal_log_path(), self._cal_log_path() + ".1"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            gcmd.respond_info("Calibration log cleared")
+            return
+        rows = self._read_cal_log()
+        who = gcmd.get('TOOLHEAD', None)
+        kind = gcmd.get('KIND', None)
+        if who:
+            rows = [r for r in rows if r.get("toolhead") == who]
+        if kind:
+            rows = [r for r in rows if r.get("kind") == kind.lower()]
+        if not rows:
+            gcmd.respond_info("No calibration runs logged yet. Log file: %s"
+                              % self._cal_log_path())
+            return
+        if action == 'SLOTS':
+            lines = self.cal_log_slot_report(rows)
+            gcmd.respond_info("\n".join(lines) if lines else
+                              "No offset runs logged yet")
+            return
+        if action == 'SHOW':
+            count = gcmd.get_int('COUNT', 30, minval=1)
+            for r in rows[-count:]:
+                vals = ", ".join("%s=%s" % (f, r.get(f)) for f in
+                                 self.CAL_LOG_FIELDS[r["kind"]])
+                extra = r.get("outcome") or r.get("target") or ""
+                if r.get("loops"):
+                    extra = "loop %d/%d%s" % (
+                        r.get("loop", 0), r["loops"],
+                        ", docked" if r.get("dock") else "")
+                slot = r.get("slot")
+                gcmd.respond_info("%s %s%s %s %s %s" % (
+                    r["t"], r["toolhead"],
+                    "" if slot is None else " (T%d)" % slot,
+                    r["kind"], vals, extra))
+            return
+        gcmd.respond_info("\n".join(self.cal_log_summary(rows) + [
+            "%d runs logged (log file: %s)" % (len(rows),
+                                               self._cal_log_path())]))
+
     def _store_path(self):
         if self.store_path_cfg:
             return self.store_path_cfg
@@ -1290,10 +1584,11 @@ class VirtualToolheads:
     def _swap_marker(self):
         return self._store_path() + ".swap"
 
-    def _mark_swap_pending(self):
+    def _mark_swap_pending(self, load=()):
         try:
             with open(self._swap_marker(), "w") as f:
-                json.dump({"at": time.time()}, f)
+                json.dump({"at": time.time(),
+                           "load": sorted(int(v) for v in load)}, f)
         except Exception:
             logging.exception("virtual_toolheads: could not write the swap "
                               "marker")
@@ -1301,16 +1596,22 @@ class VirtualToolheads:
     def _consume_swap_marker(self):
         """True if a fresh marker was there (it is removed either way)."""
         path = self._swap_marker()
+        load = []
         try:
             with open(path) as f:
-                at = float(json.load(f).get("at", 0))
+                data = json.load(f)
+            at = float(data.get("at", 0))
+            load = [int(v) for v in data.get("load", [])]
         except Exception:
             at = None
         try:
             os.remove(path)
         except OSError:
             pass
-        return at is not None and 0 <= time.time() - at <= SWAP_MARKER_TTL
+        fresh = at is not None and 0 <= time.time() - at <= SWAP_MARKER_TTL
+        # Slots whose filament is loaded again once the restart has settled.
+        self._pending_load = load if fresh else []
+        return fresh
 
     LOST_MCU = re.compile(r"Lost communication with MCU '(e(\d+))'")
 
@@ -1385,14 +1686,92 @@ class VirtualToolheads:
                 not news["conflicts"] and self.store is not None and \
                 self.calibrator._auto_open_state() == 'now':
             news = None      # straight to the calibrate screen
+        self._identity_dialog = False
         if news is not None and self.store is not None:
             try:
-                if self._show_identity(news):
+                if self._show_identity(news) and self._identity_dialog:
+                    # a dialog needs the user's attention first
+                    self._drop_pending_load("a toolhead dialog needs "
+                                            "attention first")
                     return
             except Exception:
                 logging.exception("virtual_toolheads: could not show the "
                                   "toolhead board dialog")
         self._open_calibrate_after_swap()
+        self._load_after_restart()
+
+    # ---- load filament after a swap --------------------------------------
+    def _drop_pending_load(self, why):
+        slots, self._pending_load = self._pending_load, []
+        if slots:
+            self.gcode.respond_info(
+                "Filament load skipped for %s: %s." % (
+                    ", ".join("T%d" % v for v in slots), why))
+
+    def _load_after_restart(self):
+        """Load filament in the slots chosen in the Swap flow.  When a
+        calibration is offered the load waits for it (PID tuning has to start
+        from a cold nozzle and a load heats it)."""
+        if not self._pending_load or self.store is None:
+            return
+        try:
+            offered = self.calibrator._auto_open_state() == 'now'
+        except Exception:
+            offered = False
+        if offered:
+            self.gcode.respond_info(
+                "Filament load for %s waits until the calibration is "
+                "finished or cancelled." % ", ".join(
+                    "T%d" % v for v in self._pending_load))
+            return
+        lines = self._run_pending_load()
+        if lines:
+            self._close_dialog()
+            self.gcode.respond_info("\n".join(lines))
+
+    def _close_dialog(self):
+        self._sticky = None
+        self._notice = None
+        self._last_prompt = None
+        self.gcode.respond_raw("// action:prompt_end")
+
+    def _run_pending_load(self):
+        """Load filament in the slots left in `_pending_load`; returns the
+        report lines.  Slots without filament waiting, busy ones and everything
+        during a print are skipped and said so."""
+        slots, self._pending_load = self._pending_load, []
+        if not slots:
+            return []
+        if self._printing():
+            return ["Filament load skipped: a print is running."]
+        lines = []
+        todo = []
+        for slot in slots:
+            state = self.slot_filament(slot)
+            if state == 'loaded':
+                lines.append("T%d: filament already loaded" % slot)
+            elif state == 'none':
+                lines.append("T%d: no filament to load (feeder state: %s)"
+                             % (slot, self._feeder_state_text(slot)))
+            elif state in ('unloading', 'busy'):
+                lines.append("T%d: skipped, the feeder is busy" % slot)
+            else:
+                todo.append(slot)
+        for n, slot in enumerate(todo):
+            self._status_screen("Loading filament", [
+                "Loading T%d: %s (%d of %d)." % (
+                    slot, self.store.label(self.store.layout[slot]),
+                    n + 1, len(todo)),
+                "The nozzle heats up and the filament is fed in. This can "
+                "take a few minutes, please wait."])
+            try:
+                self.gcode.run_script_from_command(
+                    "AUTO_FEEDING EXTRUDER=%d LOAD=1" % slot)
+                lines.append("T%d: filament loaded" % slot)
+            except Exception as e:
+                logging.exception("virtual_toolheads: load T%d", slot)
+                lines.append("T%d: load failed (%s)" % (slot, e))
+        return lines
 
     def _open_calibrate_after_swap(self, deadline=None):
         """Go straight to the calibrate screen if any toolhead in the layout
@@ -1486,6 +1865,11 @@ class VirtualToolheads:
                 logging.exception("virtual_toolheads: could not hook "
                                   "PID_CALIBRATE; PID calibration will not "
                                   "be tracked")
+            try:
+                self._install_home_hook()
+            except Exception:
+                logging.exception("virtual_toolheads: could not hook G28; "
+                                  "homing values will not be logged")
             try:
                 self._install_flow_hooks()
             except Exception:
@@ -1784,6 +2168,7 @@ class VirtualToolheads:
         """Dialog for the result of the start-up identification. Returns True
         if something was shown."""
         s = self.store
+        self._identity_dialog = True
         if news["unknown"]:
             self._ui_serial_unknown_for(news["unknown"][0][0], news=news)
             return True
@@ -1814,6 +2199,7 @@ class VirtualToolheads:
             self._ui_result("Toolheads detected", lines)
         else:
             # Expected outcome of a swap: a status message, no dialog.
+            self._identity_dialog = False
             self.trace_note("toolheads detected: status message")
             self.gcode.respond_info("\n".join(lines))
         return True
@@ -2288,6 +2674,14 @@ class VirtualToolheads:
         if control is None:
             return
         th_id = self.store.toolhead_in_slot(idx)
+        try:
+            run = self._file_pid(control) or self._live_pid(ex)
+            if run is not None:
+                self.log_calibration(
+                    "pid", idx, target=gcmd.get_float('TARGET', None),
+                    kp=run.get("Kp"), ki=run.get("Ki"), kd=run.get("Kd"))
+        except Exception:
+            logging.exception("virtual_toolheads: PID run not logged")
         rec = self.store.pid_values(th_id)
         chosen = None
         for cand in (self._file_pid(control), self._live_pid(ex)):
@@ -2510,6 +2904,116 @@ class VirtualToolheads:
         s.mark_flow_adopted()
         self._save()
 
+    # ---- Z homing values -------------------------------------------------
+    # The Z frame of a calibration is set by the G28 before it: the stock
+    # homing probes the build plate with the active tool and prints the
+    # values it used.  They are kept with each logged offset run, so runs
+    # can be compared by the frame they were measured in.
+    def _install_home_hook(self):
+        if self._home_hooked:
+            return
+        old = self.gcode.register_command('G28', None)
+        if old is None:
+            logging.warning("virtual_toolheads: G28 not found; homing "
+                            "values are not logged")
+            return
+        helps = getattr(self.gcode, 'gcode_help', {})
+        self.gcode.register_command('G28', self._wrap_home(old),
+                                    desc=helps.get('G28'))
+        self._home_hooked = True
+
+    def _wrap_home(self, old):
+        def hooked(gcmd):
+            grab = self._home_begin(gcmd)
+            ok = False
+            try:
+                result = old(gcmd)
+                ok = True
+                return result
+            finally:
+                self._home_end(grab, ok)
+        return hooked
+
+    def _home_begin(self, gcmd):
+        """Start listening to the G28 output.  Never raises."""
+        try:
+            self._home_depth += 1
+            if self._home_depth > 1:
+                return None             # the stock G28 calls itself
+            callbacks = getattr(self.gcode, 'output_callbacks', None)
+            if callbacks is None:
+                return None
+            seen = {}
+
+            def listen(msg):
+                try:
+                    for line in str(msg).split("\n"):
+                        line = line.strip()
+                        if line.startswith("//"):
+                            line = line[2:].strip()
+                        for prefix, key in HOME_LINES:
+                            if line.startswith(prefix):
+                                seen[key] = float(line[len(prefix):])
+                except Exception:
+                    pass
+            callbacks.append(listen)
+            return (callbacks, listen, seen, self._home_context())
+        except Exception:
+            logging.exception("virtual_toolheads: G28 not observed")
+            return None
+
+    def _home_context(self):
+        ctx = {}
+        try:
+            ex = self.printer.lookup_object('toolhead').get_extruder()
+            ctx["tool"] = ex.get_name()
+            off = getattr(ex, 'gcode_offset', None)
+            if off is not None:
+                ctx["tool_z_offset"] = float(off[2])
+        except Exception:
+            pass
+        try:
+            bed = self.printer.lookup_object('heater_bed', None)
+            if bed is not None:
+                st = bed.get_status(self.printer.get_reactor().monotonic())
+                ctx["bed_temp"] = round(float(st["temperature"]), 1)
+                ctx["bed_target"] = float(st["target"])
+        except Exception:
+            pass
+        return ctx
+
+    def _home_end(self, grab, ok):
+        self._home_depth = max(0, self._home_depth - 1)
+        if grab is None:
+            return
+        callbacks, listen, seen, ctx = grab
+        try:
+            callbacks.remove(listen)
+        except ValueError:
+            pass
+        if not ok or not seen:
+            return                  # failed, or no Z homing (G28 X Y)
+        try:
+            self._home_seq += 1
+            rec = {"t": now_str(), "n": self._home_seq}
+            rec.update(ctx)
+            rec.update(seen)
+            try:
+                mesh = self.printer.lookup_object('bed_mesh', None)
+                rec["mesh"] = bool(mesh is not None
+                                   and mesh.get_mesh() is not None)
+            except Exception:
+                pass
+            try:
+                probe = self.printer.lookup_object('probe', None)
+                last = probe.get_status(0)["last_z_result"]
+                rec["probe_z"] = float(last)
+            except Exception:
+                pass
+            self.last_home = rec
+        except Exception:
+            logging.exception("virtual_toolheads: G28 values not kept")
+
     def _install_flow_hooks(self):
         if self._flow_hooked:
             return
@@ -2591,19 +3095,23 @@ class VirtualToolheads:
             outcome[slot] = 'none'
             return
         th_id = self.store.toolhead_in_slot(slot)
+        def fin(result):
+            outcome[slot] = result
+            self.log_calibration("flow", slot, k=float(new), key=key,
+                                 before=before, outcome=result)
         if before is not None and abs(new - before) < FLOW_EPS:
             e = self.store.flow_entry(th_id, key, ex.nozzle_diameter,
                                       ex.nozzle_volume_type)
             same = e is not None and abs(e["k"] - new) < FLOW_EPS
-            outcome[slot] = 'same' if same else 'none'   # else: aborted run
+            fin('same' if same else 'none')   # else: aborted run
             return
         default = self._filament_default_k(ex, slot, st)
         if default is not None and abs(new - default) < 1e-6:
-            outcome[slot] = 'default'   # out of range: stock used the default
+            fin('default')   # out of range: stock used the default
             return
         self.store.record_flow(th_id, key, new, ex.nozzle_diameter,
                                ex.nozzle_volume_type, "calibrated")
-        outcome[slot] = 'recorded'
+        fin('recorded')
         self._save()
         logging.info("virtual_toolheads: recorded flow K %.4f (%s) for %s",
                      new, key, self.store.label(th_id))
@@ -2756,21 +3264,160 @@ class VirtualToolheads:
         if self._applying or self.store is None:
             return
         try:
+            st = self.store
+            stock = self.printer.lookup_object('extruder_offset_calibration',
+                                               None)
+            results = getattr(stock, 'last_xyz_result', None) or {}
+            raws = {}       # slot -> raw measurement of this calibration
             changed = False
             for i, ex in enumerate(self._slots()):
                 bp = getattr(ex, 'base_position', None)
                 if bp is None or len(bp) < 3:
                     continue
-                th_id = self.store.toolhead_in_slot(i)
-                if self.store.record_calibration(th_id, bp, i):
+                pos = [float(v) for v in bp[:3]]
+                res = results.get(ex.name)
+                if res is not None and len(res) >= 3 and \
+                        all(abs(a - float(b)) <= POS_TOL
+                            for a, b in zip(pos, res)) and \
+                        tuple(res[:3]) != self._seen_results.get(ex.name):
+                    raws[i] = pos
+                    self._seen_results[ex.name] = tuple(res[:3])
+                    continue
+                th_id = st.toolhead_in_slot(i)
+                if st.record_calibration(th_id, pos, i):
                     changed = True
                     logging.info("virtual_toolheads: recorded calibration "
-                                 "for %s (slot %d)", self.store.label(th_id), i)
+                                 "for %s (slot %d)", st.label(th_id), i)
+            if raws:
+                self._record_session(raws)
+                changed = True
             if changed:
                 self._save()
+            if raws:
+                # the stock code holds this session's raw values; put the
+                # frame-corrected ones back
+                self.apply_to_slots(runtime=True)
+            elif changed:
                 self._write_slot_view()
         except Exception:
             logging.exception("virtual_toolheads: offset event failed")
+
+    # ---- keeping offsets relative to T0 ------------------------------------
+    # An offset calibration measures every toolhead in the Z (and XY) frame
+    # that the homing before it set, and that frame differs from session to
+    # session (plate, bed temperature, ...).  The stock offsets are the
+    # difference to T0, so values from different sessions cannot be mixed.
+    # A session that includes T0 tells us its frame: the new values are
+    # stored as "same difference to T0, in the frame of the stored T0", so
+    # toolheads measured in other sessions stay valid.
+    FRAME_BIG = 0.3      # mm: more than a frame shift should be
+
+    @staticmethod
+    def _um(v):
+        return "X %+.0f, Y %+.0f, Z %+.0f um" % tuple(x * 1000. for x in v)
+
+    def _record_session(self, raws):
+        st = self.store
+        ref_th = st.toolhead_in_slot(0)
+        ids = list(st.ids())
+        old = {t: st.stored_base(t) for t in ids}
+        was_valid = {t: st.is_valid(t) for t in ids}
+        th_of = {slot: st.toolhead_in_slot(slot) for slot in raws}
+        notes = []
+
+        def put(slot, pos, anchored):
+            if st.record_calibration(th_of[slot], pos, slot,
+                                     anchored=anchored):
+                logging.info("virtual_toolheads: recorded calibration for %s "
+                             "(slot %d)", st.label(th_of[slot]), slot)
+
+        if 0 not in raws:
+            for slot, raw in raws.items():
+                put(slot, raw, False)
+            notes.append(
+                "T0 was not measured in this calibration, so the new offsets "
+                "could not be corrected for the frame of this session (it "
+                "typically differs by tens of um in Z, and by more in Y when "
+                "the bed temperature differs). Measure T0 together with the "
+                "toolhead next time: the calibration wizard does that unless "
+                "VT_CALIBRATION_LOOPS REF=0 was set.")
+        else:
+            raw_ref = raws[0]
+            others = {k: v for k, v in raws.items() if k != 0}
+            old_ref = old[ref_th]
+            if old_ref is not None and was_valid[ref_th]:
+                c = [o - r for o, r in zip(old_ref, raw_ref)]
+                for slot, raw in others.items():
+                    put(slot, [r + d for r, d in zip(raw, c)], True)
+                if others:
+                    notes.append(
+                        "Offsets are stored relative to T0. This session's "
+                        "frame differed from the stored T0 by %s; the new "
+                        "values were corrected for it, so toolheads "
+                        "calibrated earlier stay valid." % self._um(c))
+                else:
+                    notes.append(
+                        "T0 is the reference for all offsets. Its new "
+                        "measurement only describes this session's frame "
+                        "(%s) and was not stored; the other toolheads stay "
+                        "valid. After changing T0's nozzle, use "
+                        "VT_REPLACE_NOZZLE first." % self._um(c))
+                if max(abs(x) for x in c) > self.FRAME_BIG:
+                    notes.append(
+                        "That is a large shift for a frame change. If T0 or "
+                        "its nozzle was changed or knocked, tell VT "
+                        "(VT_REPLACE_NOZZLE) and calibrate T0 together with "
+                        "a toolhead that was not touched.")
+            elif old_ref is None:
+                for slot, raw in raws.items():
+                    put(slot, raw, True)
+            else:
+                # T0 itself changed (new nozzle): its stored value is the old
+                # tip.  Toolheads measured with it are right; the others
+                # move by the change of T0, found from those.
+                bridges = [(sl, raw) for sl, raw in others.items()
+                           if was_valid[th_of[sl]] and old[th_of[sl]]]
+                for slot, raw in raws.items():
+                    put(slot, raw, bool(bridges) or None)
+                if bridges:
+                    delta = [0., 0., 0.]
+                    for sl, raw in bridges:
+                        o = old[th_of[sl]]
+                        for k in range(3):
+                            delta[k] += ((o[k] - old_ref[k])
+                                         - (raw[k] - raw_ref[k])) / len(bridges)
+                    measured = set(th_of.values())
+                    moved = 0
+                    for t in ids:
+                        if t in measured or old[t] is None \
+                                or not was_valid[t]:
+                            continue
+                        st.rebase(t, [raw_ref[k] + (old[t][k] - old_ref[k])
+                                      - delta[k] for k in range(3)])
+                        moved += 1
+                    notes.append(
+                        "T0 was measured again (changed nozzle). The "
+                        "toolhead(s) measured with it show how much T0 "
+                        "changed (%s); the %d other stored toolhead(s) were "
+                        "moved by that, so they stay valid." % (
+                            self._um([-d for d in delta]), moved))
+                else:
+                    notes.append(
+                        "T0 was measured again but no other calibrated "
+                        "toolhead was measured with it, so the stored "
+                        "offsets of the others cannot be corrected for the "
+                        "change of T0. Calibrate T0 together with one "
+                        "toolhead that was not touched (the wizard adds T0 "
+                        "to any calibration), or recalibrate the others.")
+        self.frame_notes = notes
+        try:
+            self.gcode.respond_info("\n".join(notes))
+        except Exception:
+            pass
+
+    def take_frame_notes(self):
+        notes, self.frame_notes = self.frame_notes, []
+        return notes
 
     def _wrap_setters(self, ext_obj):
         cls = type(ext_obj)
@@ -3190,7 +3837,8 @@ class VirtualToolheads:
         ch = self._feeder_channel(slot)
         if not ch:
             return "not reported"
-        return str(ch.get("channel_state") or "unknown")
+        state = str(ch.get("channel_state") or "unknown")
+        return FEED_STATE_TEXT.get(state, state)
 
     def _nozzle_args(self, gcmd):
         return dict(diameter=gcmd.get_float('DIAMETER', None),
@@ -3580,6 +4228,7 @@ class VirtualToolheads:
         s = self.store
         sel = self._swap_sel(gcmd)
         unload = gcmd.get_int('UNLOAD', 1)
+        load = gcmd.get_int('LOAD', 0)
         csv = ",".join(str(v) for v in sel)
         p = Prompt("Swap toolheads")
         p.text("Pick the toolheads you are going to take out. The ones you "
@@ -3590,18 +4239,26 @@ class VirtualToolheads:
                 else sorted(sel + [slot])
             buttons.append(("T%d: %s" % (slot, s.label(th_id)),
                             self._ui("swap", sel=",".join(
-                                str(v) for v in nxt), unload=unload),
+                                str(v) for v in nxt), unload=unload,
+                                load=load),
                             "primary" if slot in sel else "secondary"))
         p.buttons(buttons, per_row=4)
         p.buttons([("Unload filament: %s" % ("on" if unload else "off"),
-                    self._ui("swap", sel=csv, unload=1 - unload),
-                    "primary" if unload else "secondary")])
+                    self._ui("swap", sel=csv, unload=1 - unload, load=load),
+                    "primary" if unload else "secondary"),
+                   ("Load filament after: %s" % ("on" if load else "off"),
+                    self._ui("swap", sel=csv, unload=unload, load=1 - load),
+                    "primary" if load else "secondary")])
         if unload:
             p.text("Filament loaded on the selected toolheads is unloaded.")
+        if load:
+            p.text("After the restart, filament is loaded in these slots "
+                   "(after any calibration).")
         p.text("The toolhead that is picked up is docked.")
         if sel:
             p.footer("Continue", self._ui("swap_apply", sel=csv,
-                                          unload=unload), "primary")
+                                          unload=unload, load=load),
+                     "primary")
         p.footer("Close" if self._direct else "Back", self._ui("main"))
         self._show(p)
 
@@ -3612,6 +4269,7 @@ class VirtualToolheads:
         if not sel:
             raise gcmd.error("Pick at least one toolhead")
         unload = gcmd.get_int('UNLOAD', 1)
+        load = gcmd.get_int('LOAD', 0)
         lines = ["Swapping: " + ", ".join(
             "T%d (%s)" % (v, s.label(s.layout[v])) for v in sel)]
         if unload:
@@ -3619,7 +4277,10 @@ class VirtualToolheads:
         else:
             self._dock(lines)
         lines.extend(SWAP_NOTE)
-        self._mark_swap_pending()
+        if load:
+            lines.append("Filament is loaded again in %s after the restart."
+                         % ", ".join("T%d" % v for v in sel))
+        self._mark_swap_pending(load=sel if load else ())
         self._ui_result("Swap toolheads", lines, restart=True)
 
     def _ui_layout(self, gcmd):
@@ -3940,6 +4601,7 @@ class Calibrator:
     result is recorded by the PID_CALIBRATE hook in VirtualToolheads.
     """
     COOL_TEMP = 140   # the stock preheat nozzle temperature
+    PLATE_Z = 150     # bed position that makes the build plate easy to remove
     STOCK_STATE = "XYZ_OFFSET_CALIBRATE"
     STOCK_COMMANDS = ("PRESTART", "PREHOMING", "DETECT_PLATE", "PREHEAT",
                       "MANUAL_CLEAN", "HEAT", "AUTO_CLEAN", "WAIT_COOL",
@@ -3961,6 +4623,12 @@ class Calibrator:
         self._on_since = 0.
         self._tail_until = 0.
         self._internal = 0
+        self.probe_runs = 1          # VT_CALIBRATION_LOOPS: probes per toolhead
+        self.probe_dock = False      # ... docking the toolhead between them
+        self.do_clean = True         # CLEAN=0: skip heating/cleaning steps
+        self.add_ref = True          # REF=0: do not add T0 as the reference
+        self._loop = None            # (run, runs, docked) of the probe now
+        self.repeat_notes = []
         self._hold = False          # keep the guard up (PID phase is long)
         self._pid_active = False
         self.rejected = []
@@ -4053,8 +4721,31 @@ class Calibrator:
                     "%s rejected: the virtual toolheads calibration wizard "
                     "is running (or has just finished). Finish or abort it "
                     "from its dialog (VT_CAL PAGE=abort)." % name)
-            return old(gcmd)
+            result = old(gcmd)
+            if name.endswith("PROBE_CALIBRATE"):
+                self._log_offset_run(gcmd)
+            return result
         return guarded
+
+    def _log_offset_run(self, gcmd):
+        """Log the raw probe result of one offset run (wizard or touchscreen)."""
+        try:
+            tool = str(gcmd.get('TOOL_ID', '')).upper().lstrip('T')
+            slot = int(tool)
+            res = self._stock().last_xyz_result.get(self._name(slot))
+            if res is None or len(res) < 3:
+                return
+            ctx = {}
+            if self._loop is not None and self.active():
+                run, total, dock = self._loop
+                ctx = {"loop": run, "loops": total, "dock": bool(dock),
+                       "cleaned": bool(self.do_clean)}
+            if self.vt.last_home:
+                ctx["home"] = dict(self.vt.last_home)
+            self.vt.log_calibration("offset", slot, x=float(res[0]),
+                                    y=float(res[1]), z=float(res[2]), **ctx)
+        except Exception:
+            logging.exception("virtual_toolheads: offset run not logged")
 
     def _blocked_lines(self):
         if not self.rejected:
@@ -4141,6 +4832,39 @@ class Calibrator:
             self._run_wizard(sel, plan, gcmd)
         else:
             self._show_start(sel, bool(gcmd.get_int('DIRECT', 0)), plan)
+
+    def cmd_VT_CALIBRATION_LOOPS(self, gcmd):
+        count = None
+        for name in ('N', 'COUNT', 'LOOPS'):
+            count = gcmd.get_int(name, None, minval=1, maxval=20)
+            if count is not None:
+                break
+        if count is not None:
+            self.probe_runs = count
+            self.probe_dock = False
+            self.do_clean = True
+        dock = gcmd.get_int('DOCK', None, minval=0, maxval=1)
+        if dock is not None:
+            self.probe_dock = bool(dock)
+        clean = gcmd.get_int('CLEAN', None, minval=0, maxval=1)
+        if clean is not None:
+            self.do_clean = bool(clean)
+        ref = gcmd.get_int('REF', None, minval=0, maxval=1)
+        if ref is not None:
+            self.add_ref = bool(ref)
+        gcmd.respond_info(
+            "Offset probe loops per toolhead: %d%s%s%s" % (
+                self.probe_runs,
+                ", docking between probes" if self.probe_dock else "",
+                "" if self.do_clean else
+                ", skipping the heat and cleaning steps",
+                "" if self.probe_runs == 1 else
+                " (every run is logged, the last one is saved; reset with "
+                "VT_CALIBRATION_LOOPS N=1)") + (
+            "" if self.add_ref else
+            "\nT0 is NOT added as the reference (REF=0): offsets of a "
+            "single toolhead can then not be corrected for the frame of the "
+            "session. VT_CALIBRATION_LOOPS REF=1 turns it back on."))
 
     def cmd_VT_CAL(self, gcmd):
         page = gcmd.get('PAGE', 'start').lower()
@@ -4247,6 +4971,11 @@ class Calibrator:
                "automatic clean (this extrudes filament, so load filament "
                "first), then you wipe the nozzle by hand and remove the "
                "build plate so the probe can run.")
+        if self.add_ref:
+            p.text("Offsets are stored relative to T0 (the left toolhead), "
+                   "which is measured with every offset calibration. That "
+                   "is what lets you recalibrate a single toolhead later "
+                   "without redoing the others.")
         p.buttons([toggle("Offset calibration", 'ofs')])
         p.text("PID calibration tunes the heater of each selected toolhead. "
                "It starts from a cold nozzle and takes about 5 minutes each.")
@@ -4540,14 +5269,61 @@ class Calibrator:
         self._disarm()
         self.vt._ui_result("Calibration finished", lines)
 
+    def _with_reference(self, sel):
+        """T0 is the reference of all offsets: measuring it in the same
+        session is what lets a single toolhead be recalibrated without
+        redoing the others.  T0 on its own is no use (it only defines the
+        frame), so a second, already calibrated toolhead goes with it.
+        Returns the toolheads to measure and the lines that explain it."""
+        sel = list(sel or [])
+        notes = []
+        st = self.vt.store
+        if not sel:
+            return sel, notes
+        if 0 not in sel:
+            if not self.add_ref:
+                return sel, notes
+            return [0] + sel, [
+                "T0 (%s) is measured too, as the reference: every offset is "
+                "stored relative to it, so you can recalibrate a single "
+                "toolhead later without redoing the others "
+                "(VT_CALIBRATION_LOOPS REF=0 turns this off)."
+                % self._label(0)]
+        if len(sel) > 1:
+            return sel, notes
+        # T0 alone
+        own_valid = st is not None and st.is_valid(st.toolhead_in_slot(0))
+        others = [i for i in range(1, len(self.vt._slots()))
+                  if st is not None and st.is_valid(st.toolhead_in_slot(i))]
+        if self.add_ref and others:
+            i = others[0]
+            return [0, i], [
+                "T%d (%s) is measured too: T0 alone only shows this "
+                "session's frame. %s" % (i, self._label(i),
+                    "It also shows how much T0 changed, so the other "
+                    "toolheads stay valid." if not own_valid else
+                    "Nothing would be stored for T0 otherwise.")]
+        if not self.add_ref:
+            why = "VT_CALIBRATION_LOOPS REF=0 is set"
+        else:
+            why = "no other toolhead has a valid calibration yet"
+        return sel, [
+            "Warning: T0 is calibrated on its own because %s. %s" % (why,
+                "The other toolheads cannot be corrected for a change of "
+                "T0; recalibrate them too." if not own_valid else
+                "Its measurement only describes this session and will not "
+                "be stored.")]
+
     def _begin(self, sel):
-        csv = csv_slots(sel)
         if self._busy():
             return
+        sel, ref_lines = self._with_reference(sel)
+        csv = csv_slots(sel)
         self._arm(reset=not self._hold_rejected())
-        self._status("Calibration", [
-            "Starting: homing and preheating. Calibrating: "
-            + ", ".join("T%d (%s)" % (i, self._label(i)) for i in sel)])
+        lines = ["Starting: homing and preheating. Calibrating: "
+                 + ", ".join("T%d (%s)" % (i, self._label(i)) for i in sel)]
+        lines += ref_lines
+        self._status("Calibration", lines)
 
         def prep():
             self._run("EXTRUDER_OFFSET_ACTION_PRESTART")
@@ -4568,6 +5344,11 @@ class Calibrator:
     def _clean(self, sel, i):
         tool = sel[i]
         csv = csv_slots(sel)
+        if not self.do_clean:
+            # VT_CALIBRATION_LOOPS CLEAN=0: no filament has run since the
+            # last cleaning; go straight to the cool-down to probe temperature
+            self._cool(sel, i)
+            return
         self._status("Calibration: toolhead T%d" % tool, [
             "Heating T%d (%s) and cleaning the nozzle automatically "
             "(%d of %d). This takes a few minutes." % (
@@ -4591,7 +5372,9 @@ class Calibrator:
 
     def page_cool(self, gcmd):
         sel = self._sel(gcmd)
-        i = gcmd.get_int('I', 0, minval=0, maxval=len(sel) - 1)
+        self._cool(sel, gcmd.get_int('I', 0, minval=0, maxval=len(sel) - 1))
+
+    def _cool(self, sel, i):
         tool = sel[i]
         csv = csv_slots(sel)
         self._status("Calibration: toolhead T%d" % tool, [
@@ -4604,13 +5387,30 @@ class Calibrator:
         if i + 1 < len(sel):
             self._clean(sel, i + 1)
             return
+        if not self.do_clean and not self._lower_bed(sel, i):
+            return
         p = Prompt("Remove the build plate", sticky=True)
-        p.text("All nozzles are clean. Remove the build plate from the bed "
+        p.text(("All nozzles are clean. " if self.do_clean else "")
+               + "Remove the build plate from the bed "
                "so the probe can reach the calibration fixture, then press "
                "Continue.")
         p.buttons([("Continue", cal_cmd("detect", sel=csv), "primary"),
                    ("Abort calibration", cal_cmd("abort"), "error")])
         self.vt._show(p)
+
+    def _lower_bed(self, sel, i):
+        """The stock manual-clean step lowers the bed (Z150), which is also
+        what makes the build plate easy to take off.  Without the cleaning
+        steps (CLEAN=0) that never happens, so do it before asking."""
+        def lower():
+            self._run("SAVE_GCODE_STATE NAME=VT_PLATE")
+            try:
+                self._run("G90")
+                self._run("G0 Z%d F12000" % self.PLATE_Z)
+            finally:
+                self._run("RESTORE_GCODE_STATE NAME=VT_PLATE")
+        return self._guard("Lowering the bed failed",
+                           cal_cmd("cool", sel=csv_slots(sel), i=i), lower)
 
     def page_detect(self, gcmd):
         sel = self._sel(gcmd)
@@ -4635,6 +5435,7 @@ class Calibrator:
                 "Probing T%d (%s), %d of %d." % (
                     tool, self._label(tool), j + 1, len(sel))])
             retry = cal_cmd("probe", sel=csv, i=j)
+            self._loop = (1, self.probe_runs, False)
             if not self._guard(
                     "Probing T%d failed" % tool, retry,
                     lambda: self._run("EXTRUDER_OFFSET_ACTION_PROBE_CALIBRATE "
@@ -4645,6 +5446,30 @@ class Calibrator:
                 self._error_prompt("Probing T%d failed" % tool,
                                    "The probe did not produce a result.", retry)
                 return
+            # VT_CALIBRATION_LOOPS: extra probes of the same toolhead, for studying
+            # the run-to-run variation (each one is logged).  Best effort:
+            # a failure only stops the repeats; the last result is saved.
+            for run in range(1, self.probe_runs):
+                self._status("Calibration: toolhead T%d" % tool, [
+                    "Probing T%d (%s), %d of %d, run %d of %d." % (
+                        tool, self._label(tool), j + 1, len(sel),
+                        run + 1, self.probe_runs)])
+                self._loop = (run + 1, self.probe_runs, self.probe_dock)
+                try:
+                    if self.probe_dock:
+                        # dock it; the probe command picks it up again
+                        self._run("PARK_EXTRUDER")
+                    self._run("EXTRUDER_OFFSET_ACTION_PROBE_CALIBRATE "
+                              "TOOL_ID=T%d" % tool)
+                except Exception as e:
+                    logging.exception("virtual_toolheads: repeated probe "
+                                      "failed")
+                    self.repeat_notes.append(
+                        "T%d: repeat %d of %d stopped (%s)" % (
+                            tool, run + 1, self.probe_runs,
+                            friendly_error(e)))
+                    break
+            self._loop = None
         self._finish(sel)
 
     def page_finish(self, gcmd):
@@ -4674,7 +5499,19 @@ class Calibrator:
                          + ("" if ok else "  (result NOT recorded)"))
         lines += self._blocked_lines()
         self._disarm()
+        if self.probe_runs > 1:
+            lines.append("Each toolhead was probed %d times%s (VT_CAL_LOG "
+                         "shows every run); the last result was saved."
+                         % (self.probe_runs, ", docked between probes"
+                            if self.probe_dock else ""))
+        if not self.do_clean:
+            lines.append("The heating and cleaning steps were skipped "
+                         "(VT_CALIBRATION_LOOPS CLEAN=0).")
+        lines += self.repeat_notes
+        self.repeat_notes = []
+        lines += self.vt.take_frame_notes()
         lines.append("Put the build plate back on the bed.")
+        lines += self.vt._run_pending_load()
         self.vt._ui_result("Calibration finished", lines)
 
     def page_abort(self, gcmd):
@@ -4691,6 +5528,7 @@ class Calibrator:
         lines += self._blocked_lines()
         self._disarm()
         lines.append("Put the build plate back if you removed it.")
+        lines += self.vt._run_pending_load()
         if self.vt.store is not None:
             self.vt._ui_result("Calibration", lines)
         else:

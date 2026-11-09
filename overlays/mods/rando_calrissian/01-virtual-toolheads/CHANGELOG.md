@@ -4,6 +4,69 @@ Release versions of the virtual toolheads mod (`VERSION` in
 `virtual_toolheads.py`). The store file has its own `schema_version`, which
 only changes when the file format does.
 
+## [0.7]
+
+- Offsets are stored relative to T0. An offset calibration measures every
+  toolhead in the frame that the homing before it set, which differs from
+  session to session (tens of um in Z). When a calibration includes T0, the
+  new values are stored as "the same difference to T0, in the frame of the
+  stored T0", so toolheads calibrated in other sessions stay valid. The
+  wizard adds T0 to every offset calibration (`VT_CALIBRATION_LOOPS REF=0`
+  turns that off). A calibration without T0 is stored as measured, with a
+  warning. Re-measuring T0 after a nozzle change (`VT_REPLACE_NOZZLE`) uses
+  the toolheads measured with it to move the other stored toolheads by the
+  change of T0. T0 is never calibrated on its own: the wizard adds the
+  lowest-numbered calibrated toolhead, and warns before starting if there is
+  none (or `REF=0` is set). The start prompt and the result explain what was
+  done.
+
+- With `VT_CALIBRATION_LOOPS ... CLEAN=0` the bed is lowered (Z150, as the
+  stock cleaning step does) before the "Remove the build plate" prompt, so
+  the plate is easy to take off. Without the cleaning steps nothing lowered
+  it.
+
+- Offset runs in the calibration log carry a `home` record: what the last Z
+  homing (`G28`) reported (`z_offset`, `z_overshoot_comp`, `z_mesh_complete`),
+  the tool that was active and its Z offset, the bed temperature, whether a bed
+  mesh was loaded, the raw probe Z and the time of that homing (`t`). The Z of
+  an offset run is measured in the frame that homing set, so runs with the
+  same `home.t` share a frame and runs with a different `home.t` do not.
+  Observation only: `G28` itself is unchanged.
+
+- `VT_CALIBRATION_LOOPS ... CLEAN=0` (console only) skips the heating,
+  automatic cleaning and wipe prompt of the offset calibration for repeat runs;
+  homing, preheat, the cool-down and the build plate check still run. Offset
+  runs are logged with `cleaned` true/false and the slot report marks sessions
+  that were not cleaned.
+
+- Offset runs in the calibration log record the loop number, loop count and
+  whether the toolhead was docked between probes. `VT_CAL_LOG ACTION=SLOTS`
+  shows, per toolhead and slot, the noise inside a session, the spread between
+  sessions, the drift per run and the shift between slots measured against that
+  scatter (to judge whether a per-slot offset would be consistent).
+
+- `VT_CALIBRATION_LOOPS N=5` makes the offset calibration probe each toolhead
+  N times in a row (no repeated cleaning) from the card, the dialogs and
+  `VT_CALIBRATE`. Every probe goes into the calibration log, the last result
+  is saved, and a failed repeat only stops the repeats. `DOCK=1` (console only)
+  docks the toolhead before each repeat so the pick-up is compared too.
+
+- Every calibration run is now logged (offset probe result, PID tuning, Dynamic
+  Flow K) to `persistent/virtual_toolheads_calibration_log.jsonl`, including
+  repeats the store itself ignores, so the run-to-run variation can be
+  studied. `VT_CAL_LOG` prints the mean, standard deviation and range per
+  toolhead (`ACTION=SHOW` lists runs, `ACTION=CLEAR` empties the log;
+  `TOOLHEAD=` and `KIND=offset|pid|flow` filter). The log is rotated at
+  512 KB.
+
+- Swap Tool has a **Load filament after** option (off by default, independent
+  of Unload filament; the card remembers it). After the restart filament is
+  loaded in the picked slots with the stock `AUTO_FEEDING ... LOAD=1`. If a
+  calibration is offered the load waits until it finishes or is cancelled
+  (PID tuning needs a cold nozzle). Slots without filament, already loaded
+  ones and prints are skipped; a dialog that needs attention (unknown board)
+  drops the load with a message. The choice travels in the swap marker file.
+
 ## [0.6]
 
 - After a swap restart the calibrate screen no longer opens for a missing

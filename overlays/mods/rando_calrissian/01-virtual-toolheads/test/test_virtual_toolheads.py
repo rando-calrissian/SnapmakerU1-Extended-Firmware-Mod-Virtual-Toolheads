@@ -389,15 +389,17 @@ class FakeGcode:
         self.cmds = {}
         self.not_ready_ok = set()
         self.raw = []
+        self.output_callbacks = []
         # stock RESPOND: prints "// <msg>"
         self.cmds["RESPOND"] = lambda g: self.raw.append("// " + g.get('MSG', ''))
 
     def respond_raw(self, msg):
         self.raw.append(msg)
+        for cb in list(self.output_callbacks):
+            cb(msg)
 
     def respond_info(self, msg, log=True):
-        for line in msg.split("\n"):
-            self.raw.append("// " + line)
+        self.respond_raw("// " + "\n// ".join(msg.split("\n")))
 
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
@@ -452,6 +454,9 @@ class FakeExtruder:
         self.base_position = base_position
         self.gcode_offset = [0, 0, 0] if name == "extruder" else None
         self.active_offset_calls = 0
+
+    def get_name(self):
+        return self.name
 
     def get_heater(self):
         return getattr(self, "heater", None)
@@ -564,12 +569,15 @@ def make_printer(tmp, bps=None, diameters=None):
 LEGACY_LABELS = {"LA": "A", "RA": "B", "RB": "C", "RC": "D"}
 
 
-def start(p, legacy_labels=True, **opts):
+def start(p, legacy_labels=True, add_ref=False, **opts):
     """Boot the module. Most behaviour tests are not about naming, so by
     default the four migrated toolheads are renamed to A-D; tests of the real
     default labels pass legacy_labels=False."""
     mod = vt.VirtualToolheads(FakeConfig(p, **opts))
     p.send_event("klippy:connect")
+    # most tests are about the flow of a calibration, not about T0 being
+    # added as its reference (that has its own tests)
+    mod.calibrator.add_ref = add_ref
     if legacy_labels and mod.store is not None:
         for th_id in mod.store.ids():
             if mod.store.label(th_id) in LEGACY_LABELS:
@@ -1228,12 +1236,15 @@ class UiTests(unittest.TestCase):
 
     def test_everything_already_unloaded_unloads_and_docks_nothing(self):
         p, exts, mod = self.unload_setup(set())
-        self.feeder(p, {2: (True, "unload_finish"), 3: (True, "preload_finish")})
+        self.feeder(p, {2: (True, "unload_finish"), 3: (True, "preload_finish"), 0: (False, "wait_insert")})
         p.gcode.run_line("VT_UI PAGE=layout_apply PENDING=A,B,E,F UNLOAD=1")
         text = "\n".join(p.gcode.take_prompt())
         self.assertEqual(self.unloads, [])
         self.assertEqual(self.order, [])               # nothing docked
         self.assertIn("no filament loaded (feeder state:", text)
+        self.assertNotIn("preload_finish", text)
+        self.assertNotIn("wait_insert", text)
+        self.assertIn("Filament Preloaded", text)
 
     def test_a_failed_unload_state_falls_back_to_the_sensor(self):
         p, exts, mod = self.unload_setup(set())
@@ -2232,6 +2243,234 @@ class CalibrationTests(unittest.TestCase):
         p.gcode.run_line("EXTRUDER_OFFSET_ACTION_PREHEAT")
         self.assertEqual(stock.calls[-1][0], "PREHEAT")
 
+    def test_calibration_loops_probes_each_toolhead_several_times(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        p.gcode.run_line("VT_CALIBRATION_LOOPS N=3")
+        self.assertEqual(mod.calibrator.probe_runs, 3)
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        lines = self.click(p, "VT_CAL PAGE=detect SEL=1")
+        probes = [c for c in stock.calls if c[0] == "PROBE_CALIBRATE"]
+        self.assertEqual(len(probes), 3)
+        rows = [r for r in mod._read_cal_log() if r["kind"] == "offset"]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({r["x"] for r in rows}), 3)     # three results
+        self.assertIn("probed 3 times", "\n".join(lines))
+        # the last one is what was saved
+        self.assertAlmostEqual(exts[1].base_position[0], rows[-1]["x"])
+
+    def test_calibration_loops_can_dock_between_probes(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        parks = []
+        p.gcode.cmds["PARK_EXTRUDER"] = lambda g: parks.append(1)
+        p.gcode.run_line("VT_CALIBRATION_LOOPS N=3 DOCK=1")
+        self.assertTrue(mod.calibrator.probe_dock)
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        lines = "\n".join(self.click(p, "VT_CAL PAGE=detect SEL=1"))
+        self.assertEqual(len(parks), 2)          # before repeats 2 and 3
+        self.assertEqual(len([c for c in stock.calls
+                              if c[0] == "PROBE_CALIBRATE"]), 3)
+        self.assertIn("docked between probes", lines)
+
+    def test_dock_is_off_by_default_and_reset_by_a_new_count(self):
+        p, exts, mod, stock = self.boot()
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3, DOCK=1))
+        self.assertTrue(mod.calibrator.probe_dock)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(DOCK=0))
+        self.assertFalse(mod.calibrator.probe_dock)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=2, DOCK=1))
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=2))
+        self.assertFalse(mod.calibrator.probe_dock)
+
+    def test_loop_count_and_docking_are_logged_with_each_probe(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        p.gcode.cmds["PARK_EXTRUDER"] = lambda g: None
+        p.gcode.run_line("VT_CALIBRATION_LOOPS N=3 DOCK=1")
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        self.click(p, "VT_CAL PAGE=detect SEL=1")
+        rows = [r for r in mod._read_cal_log() if r["kind"] == "offset"]
+        self.assertEqual([(r["loop"], r["loops"], r["dock"]) for r in rows],
+                         [(1, 3, False), (2, 3, True), (3, 3, True)])
+        self.assertEqual({r["slot"] for r in rows}, {1})
+        text = []
+
+        class G:
+            def get(s_, n, d=None, **kw): return {"ACTION": "SHOW"}.get(n, d)
+            def get_int(s_, n, d=None, **kw): return d
+            def respond_info(s_, m): text.append(m)
+        mod.cmd_VT_CAL_LOG(G())
+        self.assertTrue(any("loop 2/3, docked" in t for t in text))
+
+    def test_slot_report_compares_the_shift_between_slots_with_the_noise(self):
+        mod = self.boot()[2]
+        rows = []
+        t = 1000000000
+        for slot, base, sess in ((1, 10.000, 0), (1, 10.002, 1),
+                                 (3, 10.050, 0), (3, 10.048, 1)):
+            for n, jitter in enumerate((0., 0.001, -0.001, 0.0005)):
+                rows.append({"kind": "offset", "toolhead": "RA", "slot": slot,
+                             "t": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime(t)),
+                             "loop": n + 1, "loops": 4, "dock": False,
+                             "x": base + jitter, "y": 0., "z": 0.})
+                t += 140
+            t += 20000
+        text = "\n".join(mod.cal_log_slot_report(rows))
+        self.assertIn("RA slot T1: 8 runs in 2 sessions (loops: 4)", text)
+        self.assertIn("RA slot T3: 8 runs in 2 sessions", text)
+        self.assertRegex(text, r"RA slot shift T3 vs T1: x \+0\.0480 = \d+\.\dx scatter")
+
+    def test_clean_0_skips_the_heating_and_cleaning_steps(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        ran = []
+        for name in ("SAVE_GCODE_STATE", "G90", "G0", "RESTORE_GCODE_STATE"):
+            p.gcode.cmds[name] = lambda g: None
+        orig = p.gcode._process_commands
+        p.gcode._process_commands = lambda cmds, need_ack=True: (
+            ran.extend(cmds), orig(cmds, need_ack))[1]
+        p.gcode.run_line("VT_CALIBRATION_LOOPS N=2 CLEAN=0")
+        self.assertFalse(mod.calibrator.do_clean)
+        text = "\n".join(self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1"))
+        # the stock cleaning step lowers the bed; without it we do, so the
+        # build plate can be taken off
+        low = [c for c in ran if c.startswith(("SAVE_GCODE_STATE", "G90",
+                                               "G0 ", "RESTORE_GCODE_STATE"))]
+        self.assertEqual(low, ["SAVE_GCODE_STATE NAME=VT_PLATE", "G90",
+                               "G0 Z150 F12000",
+                               "RESTORE_GCODE_STATE NAME=VT_PLATE"])
+        names = [c[0] for c in stock.calls]
+        self.assertNotIn("HEAT", names)
+        self.assertNotIn("AUTO_CLEAN", names)
+        self.assertNotIn("MANUAL_CLEAN", names)
+        self.assertIn("WAIT_COOL", names)           # straight to the cool-down
+        self.assertIn("Remove the build plate", text)
+        self.assertNotIn("All nozzles are clean", text)
+        lines = "\n".join(self.click(p, "VT_CAL PAGE=detect SEL=1"))
+        self.assertIn("heating and cleaning steps were skipped", lines)
+        rows = [r for r in mod._read_cal_log() if r["kind"] == "offset"]
+        self.assertEqual([r["cleaned"] for r in rows], [False, False])
+        report = "\n".join(mod.cal_log_slot_report(rows))
+        self.assertIn("not cleaned", report)
+
+    def test_with_cleaning_the_bed_is_left_to_the_stock_clean_step(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        ran = []
+        orig = p.gcode._process_commands
+        p.gcode._process_commands = lambda cmds, need_ack=True: (
+            ran.extend(cmds), orig(cmds, need_ack))[1]
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.assertFalse([c for c in ran if "VT_PLATE" in c])
+
+    def test_a_new_loop_count_restores_cleaning(self):
+        p, exts, mod, stock = self.boot()
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3, CLEAN=0))
+        self.assertFalse(mod.calibrator.do_clean)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3))
+        self.assertTrue(mod.calibrator.do_clean)
+
+    def test_a_failing_repeat_stops_the_repeats_but_still_saves(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        p.gcode.run_line("VT_CALIBRATION_LOOPS N=4")
+        real = p.gcode.cmds["EXTRUDER_OFFSET_ACTION_PROBE_CALIBRATE"]
+        n = []
+
+        def flaky(g):
+            n.append(1)
+            if len(n) == 2:
+                raise GCodeError("probe lost")
+            return real(g)
+        p.gcode.cmds["EXTRUDER_OFFSET_ACTION_PROBE_CALIBRATE"] = flaky
+        mod.calibrator.install_guards()
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        lines = "\n".join(self.click(p, "VT_CAL PAGE=detect SEL=1"))
+        self.assertEqual(len(n), 2)
+        self.assertIn("Calibration finished", lines)
+        self.assertIn("repeat 2 of 4 stopped", lines)
+
+    def test_calibration_loops_defaults_to_one_and_reports(self):
+        p, exts, mod, stock = self.boot()
+        self.assertEqual(mod.calibrator.probe_runs, 1)
+        g = FakeGcmd(N=2)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(g)
+        self.assertEqual(mod.calibrator.probe_runs, 2)
+        self.assertIn("loops per toolhead: 2", g.out[0])
+        g = FakeGcmd()
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(g)         # just reports
+        self.assertEqual(mod.calibrator.probe_runs, 2)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=1))
+        self.assertEqual(mod.calibrator.probe_runs, 1)
+
+    def test_every_offset_run_is_logged(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        self.click(p, "VT_CAL PAGE=detect SEL=1")
+        rows = mod._read_cal_log()
+        self.assertEqual([r["kind"] for r in rows], ["offset"])
+        self.assertEqual(rows[0]["slot"], 1)
+        self.assertEqual(rows[0]["toolhead"], mod.store.label(
+            mod.store.toolhead_in_slot(1)))
+        for axis in ("x", "y", "z"):
+            self.assertIsInstance(rows[0][axis], float)
+
+    def hook_g28(self, p, mod, fail=False):
+        """A stand-in for the stock G28 that prints what the real Z homing
+        prints, under our hook."""
+        def g28(gcmd):
+            if gcmd.get("XYONLY", None) is None:
+                p.gcode.respond_info("z offset: -0.5")
+                p.gcode.respond_info("z_overshoot_comp: 0.0123")
+                p.gcode.respond_info("z_mesh_complete: -0.31")
+            if fail:
+                raise GCodeError("homing failed")
+        p.gcode.cmds["G28"] = g28
+        mod._home_hooked = False
+        mod._install_home_hook()
+
+    def test_z_homing_values_are_logged_with_each_offset_run(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        self.hook_g28(p, mod)
+        p.gcode.run_line("G28")
+        h = mod.last_home
+        self.assertEqual((h["z_offset"], h["z_overshoot_comp"],
+                          h["z_mesh_complete"]), (-0.5, 0.0123, -0.31))
+        self.assertEqual(h["tool"], "extruder")
+        self.assertEqual(h["tool_z_offset"], 0.0)
+        self.assertEqual(p.gcode.output_callbacks, [])      # listener removed
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        self.click(p, "VT_CAL PAGE=detect SEL=1")
+        row = [r for r in mod._read_cal_log() if r["kind"] == "offset"][0]
+        self.assertEqual(row["home"]["z_overshoot_comp"], 0.0123)
+        self.assertEqual(row["home"]["t"], h["t"])
+        # a second homing is a new frame
+        p.gcode.run_line("G28")
+        self.assertEqual(mod.last_home["n"], h["n"] + 1)
+
+    def test_homing_without_z_or_a_failed_homing_keeps_the_last_values(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        self.hook_g28(p, mod)
+        p.gcode.run_line("G28")
+        before = dict(mod.last_home)
+        p.gcode.run_line("G28 XYONLY=1")
+        self.assertEqual(mod.last_home, before)
+        self.hook_g28(p, mod, fail=True)
+        with self.assertRaises(GCodeError):
+            p.gcode.run_line("G28")
+        self.assertEqual(mod.last_home, before)
+        self.assertEqual(p.gcode.output_callbacks, [])
+
+    def test_offset_runs_without_any_homing_seen_log_no_home(self):
+        p, exts, mod, stock = self.boot(invalid=("B",))
+        self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
+        self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
+        self.click(p, "VT_CAL PAGE=detect SEL=1")
+        row = [r for r in mod._read_cal_log() if r["kind"] == "offset"][0]
+        self.assertNotIn("home", row)
+
     def test_guard_status_is_visible(self):
         p, exts, mod, stock = self.boot()
         g = p.gcode.run("VT_STATUS")
@@ -2405,15 +2644,15 @@ class SidesAndVersionTests(unittest.TestCase):
         data = json.load(open(self.store_path))
         self.assertEqual(data["schema_version"], vt.SCHEMA_VERSION)
         self.assertEqual(data["mod_version"], vt.VERSION)
-        self.assertEqual(vt.VERSION, "0.6")
+        self.assertEqual(vt.VERSION, "0.7")
         out = p.gcode.run("VT_STATUS").out[0].split("\n")
-        self.assertEqual(out[0], "Virtual toolheads v0.6")
+        self.assertEqual(out[0], "Virtual toolheads v0.7")
         self.assertEqual(out[1], "Slot 0 (Left Slot): LA 0.4mm "
                                  "standard/stainless  calibrated  no PID tuning")
         self.assertTrue(out[2].startswith("Slot 1 (Right Slot): RA 0.4mm"))
         st = mod.get_status()
         json.dumps(st)
-        self.assertEqual(st["version"], "0.6")
+        self.assertEqual(st["version"], "0.7")
         self.assertEqual(st["toolheads"]["LA"]["side"], "left")
         self.assertEqual(st["toolheads"]["RC"]["side"], "right")
 
@@ -2422,8 +2661,8 @@ class SidesAndVersionTests(unittest.TestCase):
         with open(self.store_path, "w") as f:
             f.write("{bad")
         p, exts, mod = self.boot()
-        self.assertIn("v0.6 unavailable", p.gcode.run("VT_STATUS").out[0])
-        self.assertEqual(mod.get_status()["version"], "0.6")
+        self.assertIn("v0.7 unavailable", p.gcode.run("VT_STATUS").out[0])
+        self.assertEqual(mod.get_status()["version"], "0.7")
 
     def test_version_matches_the_changelog(self):
         changelog = os.path.join(HERE, "..", "CHANGELOG.md")
@@ -2530,7 +2769,7 @@ class SidesAndVersionTests(unittest.TestCase):
         p.gcode.take_prompt()
         p.gcode.run_line("VT_UI")
         text = "\n".join(p.gcode.take_prompt())
-        self.assertIn("Virtual toolheads v0.6", text)
+        self.assertIn("Virtual toolheads v0.7", text)
         self.assertIn("T0: LA 0.4mm standard/stainless", text)
         self.assertIn("Spare: LB [Left Slot]", text)   # spares still show their side
 
@@ -2870,6 +3109,15 @@ class PidModuleTests(unittest.TestCase):
             saved = json.load(f)
         self.assertTrue(any(th["pid"] and th["pid"]["source"] == "calibrated"
                             for th in saved["toolheads"].values()))
+
+    def test_every_pid_run_is_logged_even_when_the_tuning_is_unchanged(self):
+        mod = self.boot()
+        for _ in range(2):
+            self.p.gcode.run_line("PID_CALIBRATE HEATER=extruder2 TARGET=230")
+        rows = [r for r in mod._read_cal_log() if r["kind"] == "pid"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["target"], 230.)
+        self.assertAlmostEqual(rows[0]["kp"], 41., places=6)
 
     def test_pid_result_is_read_from_the_controller_without_a_file(self):
         mod = self.boot()
@@ -3611,6 +3859,39 @@ class FlowModuleTests(unittest.TestCase):
             saved = json.load(f)
         self.assertEqual(saved["toolheads"][self.th(1)]["flow"]["fil:11"]["k"], 0.041)
 
+    def test_every_flow_run_is_logged_and_summarised(self):
+        self.boot()
+        self.set_spool(0, 2)
+        for k in (0.040, 0.042, 0.041):
+            self.calibrate(0, k)
+        rows = [r for r in self.mod._read_cal_log() if r["kind"] == "flow"]
+        self.assertEqual([r["k"] for r in rows], [0.040, 0.042, 0.041])
+        self.assertEqual(rows[0]["outcome"], "recorded")
+        out = []
+        class G:
+            def get(s_, n, d=None, **kw): return {"KIND": None}.get(n, d)
+            def get_int(s_, n, d=None, **kw): return d
+            def respond_info(s_, m): out.append(m)
+        self.mod.cmd_VT_CAL_LOG(G())
+        text = "\n".join(out)
+        self.assertIn("(slot T0)", text)
+        self.assertIn("3 runs", text)
+        self.assertIn("k mean 0.0410 sd 0.0010 range 0.0020", text)
+
+    def test_the_log_survives_a_restart_and_can_be_cleared(self):
+        self.boot()
+        self.set_spool(0, 2)
+        self.calibrate(0, 0.040)
+        self.assertEqual(len(self.mod._read_cal_log()), 1)
+        self.p.handlers.clear()
+        self.boot()
+        self.assertEqual(len(self.mod._read_cal_log()), 1)
+        class G:
+            def get(s_, n, d=None, **kw): return {"ACTION": "CLEAR"}.get(n, d)
+            def respond_info(s_, m): pass
+        self.mod.cmd_VT_CAL_LOG(G())
+        self.assertEqual(self.mod._read_cal_log(), [])
+
     def test_failed_unchanged_or_default_results_are_not_recorded(self):
         self.boot()
         self.calibrate(1, None)                  # aborted: K untouched
@@ -3785,6 +4066,129 @@ class FlowModuleTests(unittest.TestCase):
         mod2 = start(p2, legacy_labels=False)
         self.assertEqual(mod2.store.data["schema_version"], vt.SCHEMA_VERSION)
         self.assertTrue(os.path.exists(self.mod._store_path() + ".v3"))
+
+
+class RelativeToT0Tests(unittest.TestCase):
+    """Offsets are stored relative to T0 so sessions can be mixed."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.p, self.exts = make_printer(self.tmp, BP)
+        self.stock = FakeStockCalibration(self.p, self.exts)
+        self.mod = start(self.p)
+        self.st = self.mod.store
+        self.p.gcode.take_prompt()
+
+    def stored(self, slot):
+        return self.st.stored_base(self.st.toolhead_in_slot(slot))
+
+    def session(self, **raws):
+        """raws: slot number -> raw measurement, as the stock save does."""
+        res = {e.name: None for e in self.exts}
+        for slot, pos in raws.items():
+            res[self.exts[int(slot[1:])].name] = list(pos)
+        self.stock.last_xyz_result = res
+        for slot, pos in raws.items():
+            self.exts[int(slot[1:])].base_position = list(pos)
+        self.p.send_event(vt.OFFSET_EVENT)
+        return self.mod.calibrator.vt.take_frame_notes()
+
+    def shifted(self, slot, dz, dy=0.0):
+        b = BP[slot]
+        return [b[0], b[1] + dy, b[2] + dz]
+
+    def test_other_toolhead_is_corrected_by_the_frame_of_t0(self):
+        notes = self.session(T0=self.shifted(0, 0.05), T1=self.shifted(1, 0.05))
+        self.assertAlmostEqual(self.stored(1)[2], BP[1][2], places=6)
+        self.assertAlmostEqual(self.stored(0)[2], BP[0][2], places=6)
+        self.assertIn("relative to T0", " ".join(notes))
+        # the printer sees the corrected values
+        self.assertAlmostEqual(self.exts[1].base_position[2], BP[1][2], places=6)
+
+    def test_single_toolhead_with_t0_keeps_the_others_valid(self):
+        self.session(T0=self.shifted(0, -0.03), T2=self.shifted(2, -0.03 + 0.02))
+        self.assertAlmostEqual(self.stored(2)[2], BP[2][2] + 0.02, places=6)
+        for slot in (0, 1, 3):
+            self.assertTrue(self.st.is_valid(self.st.toolhead_in_slot(slot)))
+        self.assertAlmostEqual(self.stored(1)[2], BP[1][2], places=6)
+
+    def test_without_t0_the_value_is_taken_as_is_with_a_warning(self):
+        notes = self.session(T1=self.shifted(1, 0.04))
+        self.assertAlmostEqual(self.stored(1)[2], BP[1][2] + 0.04, places=6)
+        self.assertIn("T0 was not measured", " ".join(notes))
+
+    def test_t0_alone_does_not_change_anything_stored(self):
+        notes = self.session(T0=self.shifted(0, 0.05))
+        self.assertAlmostEqual(self.stored(0)[2], BP[0][2], places=6)
+        self.assertIn("not stored", " ".join(notes))
+        self.assertTrue(self.st.is_valid(self.st.toolhead_in_slot(1)))
+
+    def test_new_t0_nozzle_moves_the_others_by_the_change_of_t0(self):
+        p = self.p
+        p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+            self.st.toolhead_in_slot(0)))
+        self.assertFalse(self.st.is_valid(self.st.toolhead_in_slot(0)))
+        # new T0 tip sits 0.10 mm lower than the old one; T1 was measured
+        # with it in the same session (frame +0.02)
+        self.session(T0=self.shifted(0, 0.02 + 0.10),
+                     T1=self.shifted(1, 0.02))
+        # T1 relative to the new T0 is -0.10 compared with before
+        self.assertAlmostEqual(self.stored(1)[2] - self.stored(0)[2],
+                               BP[1][2] - BP[0][2] - 0.10, places=6)
+        # T2/T3 were not measured, they followed
+        self.assertAlmostEqual(self.stored(2)[2] - self.stored(0)[2],
+                               BP[2][2] - BP[0][2] - 0.10, places=6)
+        self.assertTrue(self.st.is_valid(self.st.toolhead_in_slot(2)))
+
+    def test_new_t0_without_a_bridge_says_so(self):
+        self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+            self.st.toolhead_in_slot(0)))
+        notes = self.session(T0=self.shifted(0, 0.1))
+        self.assertIn("cannot be corrected", " ".join(notes))
+
+    def test_ref_option_and_reference_is_added_to_a_single_toolhead(self):
+        cal = self.mod.calibrator
+        cal.add_ref = True
+        sel, notes = cal._with_reference([2])
+        self.assertEqual(sel, [0, 2])
+        self.assertIn("measured too", notes[0])
+        self.assertEqual(cal._with_reference([0, 2])[0], [0, 2])
+        self.p.gcode.run("VT_CALIBRATION_LOOPS", REF="0")
+        self.assertFalse(cal.add_ref)
+        self.assertEqual(cal._with_reference([2]), ([2], []))
+
+    def test_t0_alone_gets_a_valid_toolhead_added(self):
+        cal = self.mod.calibrator
+        cal.add_ref = True
+        sel, notes = cal._with_reference([0])
+        self.assertEqual(sel, [0, 1])
+        self.assertIn("T0 alone", notes[0])
+
+    def test_t0_alone_after_nozzle_change_says_others_stay_valid(self):
+        self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+            self.st.toolhead_in_slot(0)))
+        cal = self.mod.calibrator
+        cal.add_ref = True
+        sel, notes = cal._with_reference([0])
+        self.assertEqual(sel, [0, 1])
+        self.assertIn("stay valid", notes[0])
+
+    def test_t0_alone_warns_when_no_other_toolhead_is_valid(self):
+        for slot in (1, 2, 3):
+            self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+                self.st.toolhead_in_slot(slot)))
+        cal = self.mod.calibrator
+        cal.add_ref = True
+        sel, notes = cal._with_reference([0])
+        self.assertEqual(sel, [0])
+        self.assertIn("no other toolhead", notes[0])
+
+    def test_t0_alone_with_ref_off_warns(self):
+        cal = self.mod.calibrator
+        cal.add_ref = False
+        sel, notes = cal._with_reference([0])
+        self.assertEqual(sel, [0])
+        self.assertIn("REF=0", notes[0])
 
 
 class WizardStagesTests(unittest.TestCase):
@@ -4577,28 +4981,28 @@ class SwapFlowTests(BoardFixture):
         self.p.gcode.run_line("VT_UI PAGE=layout")
         text = self.prompt()
         self.assertIn("Swap toolheads", text)
-        self.assertIn("T1: RA|VT_UI PAGE=swap SEL=1 UNLOAD=1", text)
+        self.assertIn("T1: RA|VT_UI PAGE=swap SEL=1 UNLOAD=1 LOAD=0", text)
         self.assertIn("Unload filament: on", text)        # on by default
         self.assertNotIn("Continue", text)               # nothing picked yet
 
     def test_selecting_toggles_and_offers_continue(self):
         self.p.gcode.run_line("VT_UI PAGE=swap SEL=1,2 UNLOAD=1")
         text = self.prompt()
-        self.assertIn("T1: RA|VT_UI PAGE=swap SEL=2 UNLOAD=1|primary", text)
-        self.assertIn("T3: RC|VT_UI PAGE=swap SEL=1,2,3 UNLOAD=1|secondary",
+        self.assertIn("T1: RA|VT_UI PAGE=swap SEL=2 UNLOAD=1 LOAD=0|primary", text)
+        self.assertIn("T3: RC|VT_UI PAGE=swap SEL=1,2,3 UNLOAD=1 LOAD=0|secondary",
                       text)
-        self.assertIn("Unload filament: on|VT_UI PAGE=swap SEL=1,2 UNLOAD=0",
+        self.assertIn("Unload filament: on|VT_UI PAGE=swap SEL=1,2 UNLOAD=0 LOAD=0",
                       text)
-        self.assertIn("Continue|VT_UI PAGE=swap_apply SEL=1,2 UNLOAD=1", text)
+        self.assertIn("Continue|VT_UI PAGE=swap_apply SEL=1,2 UNLOAD=1 LOAD=0", text)
 
     def test_the_card_button_preselects_its_slot(self):
         self.p.gcode.run_line(
             "VT_UI PAGE=layout_slot SLOT=2 PENDING=LA,RA,RB,RC DIRECT=1")
         text = self.prompt()
         self.assertIn("Swap toolheads", text)
-        self.assertIn("T2: RB|VT_UI PAGE=swap SEL= UNLOAD=1 DIRECT=1|primary",
+        self.assertIn("T2: RB|VT_UI PAGE=swap SEL= UNLOAD=1 LOAD=0 DIRECT=1|primary",
                       text)
-        self.assertIn("Continue|VT_UI PAGE=swap_apply SEL=2 UNLOAD=1 DIRECT=1",
+        self.assertIn("Continue|VT_UI PAGE=swap_apply SEL=2 UNLOAD=1 LOAD=0 DIRECT=1",
                       text)
 
     def test_continue_unloads_docks_and_offers_the_restart(self):
@@ -4680,6 +5084,125 @@ class SwapFlowTests(BoardFixture):
         self.assertEqual([mod.store.label(i) for i in mod.store.layout],
                          ["LA", "RB", "RA", "RC"])
         self.assertIn("VT_CAL PAGE=prep", text)
+
+    def swap_with_load(self, load=1, sel="2"):
+        self.p.gcode.cmds["PARK_EXTRUDER"] = lambda g: None
+        self.p.gcode.run_line(
+            "VT_UI PAGE=swap_apply SEL=%s UNLOAD=0 LOAD=%d" % (sel, load))
+        self.p.gcode.take_prompt()
+
+    def no_calibration(self):
+        """Nothing is offered for calibration, so the load is not held back."""
+        orig = vt.Calibrator._auto_open_state
+        vt.Calibrator._auto_open_state = lambda self: None
+        self.addCleanup(setattr, vt.Calibrator, "_auto_open_state", orig)
+
+    def feed_calls(self):
+        calls = []
+        self.p.gcode.cmds["AUTO_FEEDING"] = lambda g: calls.append(
+            (g.get("EXTRUDER"), g.get("LOAD"), g.get("UNLOAD", None)))
+        return calls
+
+    def test_the_swap_screen_has_an_independent_load_option(self):
+        self.p.gcode.run_line("VT_UI PAGE=swap SEL=1,2 UNLOAD=1")
+        text = self.prompt()
+        self.assertIn("Load filament after: off|VT_UI PAGE=swap SEL=1,2 "
+                      "UNLOAD=1 LOAD=1", text)
+        self.assertIn("Unload filament: on|VT_UI PAGE=swap SEL=1,2 UNLOAD=0 "
+                      "LOAD=0", text)
+        self.p.gcode.run_line("VT_UI PAGE=swap SEL=1,2 UNLOAD=0 LOAD=1")
+        text = self.prompt()
+        self.assertIn("Load filament after: on|VT_UI PAGE=swap SEL=1,2 "
+                      "UNLOAD=0 LOAD=0", text)
+        self.assertIn("Continue|VT_UI PAGE=swap_apply SEL=1,2 UNLOAD=0 "
+                      "LOAD=1", text)
+
+    def test_load_is_off_by_default_and_nothing_is_loaded(self):
+        calls = self.feed_calls()
+        self.swap_with_load(load=0)
+        self.boot()
+        self.assertEqual(calls, [])
+
+    def test_load_after_the_restart_loads_the_swapped_slots(self):
+        self.no_calibration()
+        calls = self.feed_calls()
+        self.swap_with_load(load=1, sel="1,2")
+        self.assertIn("load", open(self.mod._swap_marker()).read())
+        self.boot()
+        self.assertEqual(calls, [("1", "1", None), ("2", "1", None)])
+        text = self.prompt()
+        self.assertIn("// T1: filament loaded", text)
+        self.assertIn("// T2: filament loaded", text)
+        self.assertNotIn("prompt_begin Toolhead", text)
+        # one-shot: a later restart loads nothing
+        self.boot()
+        self.assertEqual(len(calls), 2)
+
+    def test_slots_without_filament_or_already_loaded_are_skipped(self):
+        self.no_calibration()
+        calls = self.feed_calls()
+        state = {1: ("wait_insert", False), 2: ("load_finish", True)}
+
+        class Feed:
+            def get_status(self, t=None):
+                return {"extruder%d" % i: {"filament_detected": d,
+                                           "channel_state": st}
+                        for i, (st, d) in state.items()}
+        self.p.objects["filament_feed left"] = Feed()
+        self.swap_with_load(load=1, sel="1,2")
+        self.boot()
+        self.assertEqual(calls, [])
+        text = self.prompt()
+        self.assertIn("T1: no filament to load", text)
+        self.assertIn("T2: filament already loaded", text)
+
+    def test_a_failed_load_is_reported_and_the_next_slot_is_tried(self):
+        self.no_calibration()
+        calls = []
+
+        def feeding(g):
+            calls.append(g.get("EXTRUDER"))
+            if g.get("EXTRUDER") == "1":
+                raise GCodeError("jam")
+        self.p.gcode.cmds["AUTO_FEEDING"] = feeding
+        self.swap_with_load(load=1, sel="1,2")
+        self.boot()
+        self.assertEqual(calls, ["1", "2"])
+        text = self.prompt()
+        self.assertIn("T1: load failed", text)
+        self.assertIn("T2: filament loaded", text)
+
+    def test_load_waits_for_the_calibration_screen(self):
+        calls = self.feed_calls()
+        self.swap_with_load(load=1, sel="1,2")
+        self.swap_cables(1, 2)
+        mod = self.boot_needy([1])
+        text = self.prompt()
+        self.assertIn("VT_CAL PAGE=prep", text)
+        self.assertIn("waits until the calibration", text)
+        self.assertEqual(calls, [])
+        lines = mod._run_pending_load()          # what finishing / cancelling does
+        self.assertEqual(calls, [("1", "1", None), ("2", "1", None)])
+        self.assertIn("T1: filament loaded", lines)
+
+    def test_a_dialog_that_needs_attention_drops_the_load(self):
+        calls = self.feed_calls()
+        self.swap_with_load(load=1)
+        self.serials["/dev/port2"] = "BRANDNEW"       # unknown board
+        self.boot()
+        self.assertEqual(calls, [])
+        text = self.prompt()
+        self.assertIn("New toolhead board", text)
+        self.assertIn("Filament load skipped for T2", text)
+
+    def test_no_load_during_a_print(self):
+        calls = self.feed_calls()
+        self.no_calibration()
+        self.swap_with_load(load=1)
+        self.p.print_stats.state = "printing"
+        self.boot()
+        self.assertEqual(calls, [])
+        self.assertIn("a print is running", self.prompt())
 
     def boot_needy(self, needy):
         self.p.handlers.clear()

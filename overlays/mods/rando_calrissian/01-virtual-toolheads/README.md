@@ -48,7 +48,7 @@ format, reflecting the toolheads currently loaded.
   layout that breaks this; the layout dialog only offers toolheads that fit the
   slot. Default labels are the side prefix plus a letter counted per side
   (`LA`, `LB`, `RA`, `RB`, ...).
-* **Versions.** `VERSION` ("0.6") is the release of the mod as a whole and is
+* **Versions.** `VERSION` ("0.7") is the release of the mod as a whole and is
   stamped into the store as `mod_version`; `SCHEMA_VERSION` (6) is the file
   format. A schema 2 to 5 file is upgraded on first start: the original is kept
   once as `virtual_toolheads.json.v<old>`.
