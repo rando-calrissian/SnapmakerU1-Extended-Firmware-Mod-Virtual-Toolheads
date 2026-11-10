@@ -175,7 +175,7 @@ homing before it, and that frame differs a little from session to session
 stores the difference to T0, so values from different sessions cannot be
 mixed. To allow recalibrating a single toolhead, the wizard measures T0 in
 every offset calibration and stores the other toolheads relative to the stored
-T0; the others stay valid. `VT_CALIBRATION_LOOPS REF=0` turns this off (the
+T0; the others stay valid. `VT_CALIBRATION_OPTIONS REF=0` turns this off (the
 result is then stored as measured, with a warning).
 
 After changing T0's nozzle, run `VT_REPLACE_NOZZLE` for it and calibrate T0
@@ -188,6 +188,17 @@ toolhead that has a valid calibration and says so on the start prompt. If no
 other toolhead is calibrated yet, or `REF=0` is set, it warns before starting
 that the other toolheads cannot be corrected for a change of T0 and have to be
 recalibrated.
+
+Each stored calibration records the coordinate frame it is in (a random ID,
+not a time). Calibrations measured together with T0 share T0's frame; one
+measured without T0 gets a frame of its own. A toolhead in another frame than
+T0 (everything calibrated before 0.7 in a different session, spares, or any
+toolhead after the T0 toolhead was swapped for one from another frame) is shown
+as "NOT ALIGNED TO T0" in `VT_STATUS` and marked in the calibrate prompt.
+Nothing is changed or preselected; calibrate it, together with T0, to align it,
+especially before swapping a spare in. Each save is also written to the
+calibration log as a `store` row (session, frame, raw measurement, stored value
+and the shift between them), so you can check afterwards what a calibration did.
 
 ### PID tuning
 
@@ -273,13 +284,13 @@ toolhead, slot and nozzle. Unlike the toolhead store, which ignores a repeat
 that gives the same value, the log keeps every run. `VT_CAL_LOG` prints the
 number of runs and the mean, standard deviation and range per toolhead and
 kind; `VT_CAL_LOG ACTION=SHOW [COUNT=30]` lists the latest runs, `TOOLHEAD=`
-and `KIND=offset|pid|flow` filter, and `ACTION=CLEAR` empties the log. `ACTION=SLOTS` breaks the offset runs down per toolhead and slot: the noise inside a session, the spread between sessions, the drift per run (in um) and the shift between slots as a multiple of the scatter. Offset runs also record the loop number, the loop count and whether the toolhead was docked between probes (`VT_CALIBRATION_LOOPS`). They also record a `home` entry with what the last Z homing (`G28`) printed (`z_offset`, `z_overshoot_comp`, `z_mesh_complete`), the tool that was active and its Z offset, the bed temperature, and the time of that homing (`home.t`). The Z of an offset run is measured in the frame that homing set, so group runs by `home.t` to tell a shift of that frame from a shift of the toolhead. It is
+and `KIND=offset|pid|flow|store` filter, and `ACTION=CLEAR` empties the log. `ACTION=SLOTS` breaks the offset runs down per toolhead and slot: the noise inside a session, the spread between sessions, the drift per run (in um) and the shift between slots as a multiple of the scatter. Offset runs also record the loop number, the loop count and whether the toolhead was docked between probes (`VT_CALIBRATION_LOOPS`). They also record a `home` entry with what the last Z homing (`G28`) printed (`z_offset`, `z_overshoot_comp`, `z_mesh_complete`), the tool that was active and its Z offset, the bed temperature, and the time of that homing (`home.t`). The Z of an offset run is measured in the frame that homing set, so group runs by `home.t` to tell a shift of that frame from a shift of the toolhead. It is
 for judging how repeatable the calibrations are before deciding whether
 averaging several runs is worth it. Runs that Klipper reports as aborted or
 that fell back to the filament default are left out of the statistics. The
 file is rotated at 512 KB (the older half becomes `.1`).
 
-The offset calibration can probe each toolhead several times in a row, without repeating the cleaning steps: `VT_CALIBRATION_LOOPS N=5` sets the number of probes (1 is normal, up to 20; `VT_CALIBRATION_LOOPS` alone shows it, and it resets on a Klipper restart). Klipper needs the `N=` form; a bare number is rejected by Klipper itself. The setting applies to every way of starting the calibration (the card, the dialogs and `VT_CALIBRATE`). `VT_CALIBRATION_LOOPS N=5 DOCK=1` also docks the toolhead (`PARK_EXTRUDER`) before each repeat, so the probe command picks it up again and the pick-up is part of what you compare; a new `N=` without `DOCK=1` switches it off again. `CLEAN=0` (also console only) skips the heating, automatic cleaning and the wipe prompt, for repeat runs when no filament has run since the last cleaning; homing, preheating, the cool-down to probe temperature and the build plate check still run (homing needs the plate on, so put it on for the start, then remove it when asked). The runs are logged as not cleaned. Every probe is logged, the last result is saved, and a failure in a repeat stops only the repeats and is mentioned on the result screen.
+The offset calibration can probe each toolhead several times in a row, without repeating the cleaning steps: `VT_CALIBRATION_LOOPS N=5` sets the number of probes (1 is normal, up to 20; `VT_CALIBRATION_LOOPS` alone shows it, and it resets on a Klipper restart). Klipper needs the `N=` form; a bare number is rejected by Klipper itself. The setting applies to every way of starting the calibration (the card, the dialogs and `VT_CALIBRATE`). `VT_CALIBRATION_LOOPS N=5 DOCK=1` also docks the toolhead (`PARK_EXTRUDER`) before each repeat, so the probe command picks it up again and the pick-up is part of what you compare; a new `N=` without `DOCK=1` switches it off again. `VT_CALIBRATION_OPTIONS CLEAN=0` (also console only; `VT_CALIBRATION_OPTIONS` alone shows the options) skips the heating, automatic cleaning and the wipe prompt, for repeat runs when no filament has run since the last cleaning; homing, preheating, the cool-down to probe temperature and the build plate check still run (homing needs the plate on, so put it on for the start, then remove it when asked). The runs are logged as not cleaned. Every probe is logged, the last result is saved, and a failure in a repeat stops only the repeats and is mentioned on the result screen.
 
 ### Toolhead boards (automatic swap detection)
 

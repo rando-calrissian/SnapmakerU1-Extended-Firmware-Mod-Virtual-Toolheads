@@ -2363,12 +2363,28 @@ class CalibrationTests(unittest.TestCase):
         self.click(p, "VT_CAL PAGE=prep SEL=1 OFS=1")
         self.assertFalse([c for c in ran if "VT_PLATE" in c])
 
-    def test_a_new_loop_count_restores_cleaning(self):
+    def test_loops_and_options_are_separate_commands(self):
         p, exts, mod, stock = self.boot()
-        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3, CLEAN=0))
+        cal = mod.calibrator
+        out = p.gcode.run("VT_CALIBRATION_OPTIONS", CLEAN="0", REF="0").out
+        self.assertFalse(cal.do_clean)
+        self.assertFalse(cal.add_ref)
+        self.assertIn("CLEAN=0", "\n".join(out))
+        self.assertIn("REF=0", "\n".join(out))
+        cal.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3))     # does not touch them
+        self.assertEqual(cal.probe_runs, 3)
+        self.assertFalse(cal.do_clean)
+        self.assertFalse(cal.add_ref)
+        p.gcode.run("VT_CALIBRATION_OPTIONS", CLEAN="1", REF="1")
+        self.assertTrue(cal.do_clean)
+        self.assertTrue(cal.add_ref)
+
+    def test_clean_and_ref_on_the_loops_command_still_work_with_a_hint(self):
+        p, exts, mod, stock = self.boot()
+        g = FakeGcmd(CLEAN=0)
+        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(g)
         self.assertFalse(mod.calibrator.do_clean)
-        mod.calibrator.cmd_VT_CALIBRATION_LOOPS(FakeGcmd(N=3))
-        self.assertTrue(mod.calibrator.do_clean)
+        self.assertIn("VT_CALIBRATION_OPTIONS", "\n".join(g.out))
 
     def test_a_failing_repeat_stops_the_repeats_but_still_saves(self):
         p, exts, mod, stock = self.boot(invalid=("B",))
@@ -2409,8 +2425,12 @@ class CalibrationTests(unittest.TestCase):
         self.click(p, "VT_CAL PAGE=cool SEL=1 I=0")
         self.click(p, "VT_CAL PAGE=detect SEL=1")
         rows = mod._read_cal_log()
-        self.assertEqual([r["kind"] for r in rows], ["offset"])
+        self.assertEqual([r["kind"] for r in rows], ["offset", "store"])
         self.assertEqual(rows[0]["slot"], 1)
+        self.assertTrue(rows[1]["session"])
+        self.assertTrue(rows[1]["frame"])
+        self.assertEqual(rows[1]["how"], "no_t0")
+        self.assertEqual(rows[1]["ver"], vt.VERSION)
         self.assertEqual(rows[0]["toolhead"], mod.store.label(
             mod.store.toolhead_in_slot(1)))
         for axis in ("x", "y", "z"):
@@ -4144,7 +4164,7 @@ class RelativeToT0Tests(unittest.TestCase):
         self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
             self.st.toolhead_in_slot(0)))
         notes = self.session(T0=self.shifted(0, 0.1))
-        self.assertIn("cannot be corrected", " ".join(notes))
+        self.assertIn("cannot be tied", " ".join(notes))
 
     def test_ref_option_and_reference_is_added_to_a_single_toolhead(self):
         cal = self.mod.calibrator
@@ -4189,6 +4209,79 @@ class RelativeToT0Tests(unittest.TestCase):
         sel, notes = cal._with_reference([0])
         self.assertEqual(sel, [0])
         self.assertIn("REF=0", notes[0])
+
+    # ---- not aligned to T0 -----------------------------------------------
+    def _frames(self, **frames):
+        """slot name -> frame id for the stored calibrations (T0=, T1=, ...)"""
+        for key, frame in frames.items():
+            c = self.st.get(self.st.toolhead_in_slot(int(key[1:])))["calibration"]
+            c["frame"] = frame
+
+    def test_fixtures_start_in_one_frame(self):
+        for slot in range(4):
+            self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(slot)))
+
+    def test_a_toolhead_in_another_frame_is_not_aligned_to_t0(self):
+        self._frames(T1="other")
+        self.assertTrue(self.st.frame_stale(self.st.toolhead_in_slot(1)))
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(0)))
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(2)))
+
+    def test_when_t0_is_in_another_frame_everything_else_is_flagged(self):
+        self._frames(T0="other")
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(0)))
+        for slot in (1, 2, 3):
+            self.assertTrue(self.st.frame_stale(self.st.toolhead_in_slot(slot)))
+
+    def test_measured_without_t0_gets_a_frame_of_its_own(self):
+        self.session(T1=self.shifted(1, 0.04))
+        self.assertTrue(self.st.frame_stale(self.st.toolhead_in_slot(1)))
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(2)))
+
+    def test_measured_with_t0_shares_its_frame(self):
+        self.session(T0=self.shifted(0, 0.05), T1=self.shifted(1, 0.05))
+        self.assertEqual(self.st.frame_of(self.st.toolhead_in_slot(1)),
+                         self.st.frame_of(self.st.toolhead_in_slot(0)))
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(1)))
+
+    def test_new_t0_toolhead_in_another_frame_is_tied_by_a_bridge(self):
+        self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+            self.st.toolhead_in_slot(0)))
+        self._frames(T0="lb-old-frame")
+        self.session(T0=self.shifted(0, 0.05), T1=self.shifted(1, 0.05))
+        self.assertEqual(self.st.frame_of(self.st.toolhead_in_slot(0)),
+                         self.st.frame_of(self.st.toolhead_in_slot(1)))
+        for slot in range(4):
+            self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(slot)))
+
+    def test_a_save_is_logged_with_session_frame_and_shift(self):
+        self.session(T0=self.shifted(0, 0.05), T1=self.shifted(1, 0.05))
+        rows = [r for r in self.mod._read_cal_log() if r["kind"] == "store"]
+        self.assertEqual([r["slot"] for r in rows], [1])
+        r = rows[0]
+        self.assertEqual(r["how"], "relative")
+        self.assertEqual(r["frame"], self.st.frame_of(self.st.toolhead_in_slot(0)))
+        self.assertAlmostEqual(r["shift"][2], -0.05, places=5)
+        self.assertEqual(r["ver"], vt.VERSION)
+        self.assertTrue(r["session"])
+
+    def test_invalid_toolheads_are_not_reported(self):
+        self._frames(T1="other")
+        self.p.gcode.run("VT_REPLACE_NOZZLE", TOOLHEAD=self.st.label(
+            self.st.toolhead_in_slot(1)))
+        self.assertFalse(self.st.frame_stale(self.st.toolhead_in_slot(1)))
+
+    def test_status_summary_and_prompt_show_it(self):
+        self._frames(T1="other")
+        label = self.st.label(self.st.toolhead_in_slot(1))
+        self.assertTrue(self.mod.get_status()["toolheads"][label]["frame_stale"])
+        self.assertIn("NOT ALIGNED TO T0",
+                      "\n".join(self.mod._summary_lines()))
+        self.mod.calibrator._needs = lambda *a, **k: {}   # nothing else needed
+        self.mod.calibrator._show_start([])
+        text = "\n".join(str(l) for l in self.p.gcode.take_prompt())
+        self.assertIn("Not aligned to T0: %s" % label, text)
+        self.assertIn("(not aligned to T0)", text)
 
 
 class WizardStagesTests(unittest.TestCase):
@@ -4673,6 +4766,98 @@ class SpoolmanLookupTests(unittest.TestCase):
         self.assertTrue(got.wait(5))
         callbacks[0](0.)
         self.assertEqual(result, [None])
+
+
+###########################################################################
+# Schema 7: coordinate frames
+###########################################################################
+class FrameMigrationTests(unittest.TestCase):
+    def v6(self, spec):
+        """spec: slot -> (at, anchored) for the four toolheads of slots4()"""
+        s = vt.VirtualToolheadStore.from_slots(slots4())
+        d = s.to_dict()
+        d["schema_version"] = 6
+        for slot, (at, anchored) in spec.items():
+            c = d["toolheads"][d["layout"][slot]]["calibration"]
+            c["at"] = at
+            if anchored is not None:
+                c["anchored"] = anchored
+        for th in d["toolheads"].values():
+            for key in ("frame", "session", "format", "mod_version"):
+                th["calibration"].pop(key, None)
+        return d
+
+    def frames(self, s):
+        return [s.frame_of(s.toolhead_in_slot(i)) for i in range(4)]
+
+    def test_values_saved_together_share_a_frame_and_others_do_not(self):
+        s = vt.VirtualToolheadStore.from_dict(self.v6({
+            0: ("2026-08-22T07:29:51Z", None),
+            1: ("2026-08-22T07:29:51Z", None),
+            2: ("2026-08-11T08:39:56Z", None),
+            3: ("2026-08-22T07:29:52Z", None)}))
+        self.assertEqual(s.migrated_from, 6)
+        f = self.frames(s)
+        self.assertEqual(f[0], f[1])
+        self.assertEqual(f[0], f[3])
+        self.assertNotEqual(f[0], f[2])
+        self.assertTrue(s.frame_stale(s.toolhead_in_slot(2)))
+        self.assertFalse(s.frame_stale(s.toolhead_in_slot(1)))
+
+    def test_a_value_stored_relative_to_t0_joins_the_frame_of_t0(self):
+        s = vt.VirtualToolheadStore.from_dict(self.v6({
+            0: ("2026-08-22T07:29:51Z", None),
+            1: ("2026-08-22T17:22:41Z", True),
+            2: ("2026-08-22T07:29:51Z", None),
+            3: ("2026-08-22T07:29:51Z", None)}))
+        f = self.frames(s)
+        self.assertEqual(len(set(f)), 1)
+        c = s.get(s.toolhead_in_slot(1))["calibration"]
+        self.assertNotIn("anchored", c)
+        self.assertEqual(c["format"], 2)
+
+    def test_measured_without_t0_stays_in_its_own_frame(self):
+        s = vt.VirtualToolheadStore.from_dict(self.v6({
+            0: ("2026-08-22T07:29:51Z", None),
+            1: ("2026-08-22T07:29:51Z", False),
+            2: ("2026-08-22T07:29:51Z", None),
+            3: ("2026-08-22T07:29:51Z", None)}))
+        f = self.frames(s)
+        self.assertNotEqual(f[1], f[0])
+        self.assertEqual(f[0], f[2])
+
+    def test_a_clock_that_jumped_never_hides_a_difference(self):
+        # nothing is ever grouped across more than the session window
+        s = vt.VirtualToolheadStore.from_dict(self.v6({
+            0: ("2026-08-22T07:29:51Z", None),
+            1: ("2026-08-22T07:40:00Z", None),
+            2: ("2026-08-22T07:50:00Z", None),
+            3: ("2026-08-22T08:00:00Z", None)}))
+        self.assertEqual(len(set(self.frames(s))), 4)
+
+    def test_toolheads_without_a_calibration_have_no_frame(self):
+        d = self.v6({0: ("2026-08-22T07:29:51Z", None)})
+        d["toolheads"][d["layout"][3]]["calibration"].update(
+            base_position=None, valid=False, reason="never_calibrated")
+        s = vt.VirtualToolheadStore.from_dict(d)
+        self.assertIsNone(s.frame_of(s.toolhead_in_slot(3)))
+
+    def test_a_fresh_store_starts_in_one_frame(self):
+        s = vt.VirtualToolheadStore.from_slots(slots4())
+        self.assertEqual(len(set(self.frames(s))), 1)
+        self.assertIsNotNone(self.frames(s)[0])
+
+    def test_recording_in_a_frame_keeps_or_changes_it(self):
+        s = vt.VirtualToolheadStore.from_slots(slots4())
+        a = s.layout[1]
+        frame = s.frame_of(a)
+        self.assertFalse(s.record_calibration(a, BP[1], 1))     # unchanged
+        self.assertEqual(s.frame_of(a), frame)
+        self.assertTrue(s.record_calibration(a, BP[1], 1, frame="new"))
+        self.assertEqual(s.frame_of(a), "new")
+        self.assertTrue(s.record_calibration(a, [1, 2, 3], 1))
+        self.assertNotIn(s.frame_of(a), (frame, "new"))
+
 
 
 ###########################################################################

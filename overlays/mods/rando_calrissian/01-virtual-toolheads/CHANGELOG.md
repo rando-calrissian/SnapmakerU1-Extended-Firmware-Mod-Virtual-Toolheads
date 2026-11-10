@@ -6,21 +6,50 @@ only changes when the file format does.
 
 ## [0.7]
 
-- Offsets are stored relative to T0. An offset calibration measures every
-  toolhead in the frame that the homing before it set, which differs from
-  session to session (tens of um in Z). When a calibration includes T0, the
-  new values are stored as "the same difference to T0, in the frame of the
-  stored T0", so toolheads calibrated in other sessions stay valid. The
-  wizard adds T0 to every offset calibration (`VT_CALIBRATION_LOOPS REF=0`
-  turns that off). A calibration without T0 is stored as measured, with a
-  warning. Re-measuring T0 after a nozzle change (`VT_REPLACE_NOZZLE`) uses
-  the toolheads measured with it to move the other stored toolheads by the
-  change of T0. T0 is never calibrated on its own: the wizard adds the
-  lowest-numbered calibrated toolhead, and warns before starting if there is
-  none (or `REF=0` is set). The start prompt and the result explain what was
-  done.
+- **Store schema 7: coordinate frames.** An offset calibration measures in the
+  frame that the homing before it set, which differs from session to session
+  (tens of um in Z, more in Y), and offsets can only be compared when they
+  share a frame. Each stored calibration now has a `frame` (a random UUID),
+  the `session` it was saved in (one homing = one session), a `format` and the
+  `mod_version` that wrote it. Nothing depends on the clock any more.
+  Upgrading from schema 6 backs the file up (`.v6`) and groups the old values
+  once: values saved within 5 minutes of each other share a frame, every other
+  value gets its own, values 0.7 stored relative to T0 join T0's frame, and
+  values measured without T0 keep their own. (That can flag too much after the
+  upgrade, never too little.)
 
-- With `VT_CALIBRATION_LOOPS ... CLEAN=0` the bed is lowered (Z150, as the
+- Offsets are stored relative to T0. When a calibration includes T0, the other
+  toolheads are corrected for the difference between this session's frame and
+  the stored T0's and stored in T0's frame, so toolheads calibrated in other
+  sessions stay valid. The wizard adds T0 to every offset calibration
+  (`VT_CALIBRATION_OPTIONS REF=0` turns that off). A calibration without T0 is
+  stored in a frame of its own, with a warning. T0 is never calibrated on its
+  own: the wizard adds the lowest-numbered calibrated toolhead, and warns
+  before starting if there is none (or `REF=0` is set). Calibrating a T0 that
+  has no usable stored value (new nozzle, or a left-slot toolhead that was
+  never calibrated) with a calibrated toolhead ties T0 to the frame of the
+  stored offsets, and the toolheads that were not measured keep their
+  calibration. The start prompt and the result explain what was done.
+
+- Toolheads whose offset is in another frame than T0's are flagged:
+  `VT_STATUS` shows "NOT ALIGNED TO T0 (recalibrate)", the status has
+  `frame_stale` per toolhead, and the calibrate prompt marks them and says
+  why. Nothing is preselected or changed; calibrate them (T0 is added) to
+  align them. A T0 toolhead swapped in from another frame flags all the
+  others, until it is calibrated with one of them.
+
+- The calibration log has a new kind, `store`: one row per toolhead stored by
+  an offset calibration, with the `session`, the `frame`, how it was stored
+  (`relative`, `bridge`, `no_t0`, `first`), the raw measurement, the stored
+  base and the shift between them. Offset rows carry the `session` of their
+  homing, and every row the `ver` of the module that wrote it.
+
+- `VT_CALIBRATION_OPTIONS [CLEAN=0|1] [REF=0|1]` holds the options of the
+  offset calibration (shown when called without arguments). `CLEAN` and `REF`
+  are still accepted by `VT_CALIBRATION_LOOPS`, with a hint; a new loop count
+  no longer resets `CLEAN`.
+
+- With `VT_CALIBRATION_OPTIONS CLEAN=0` the bed is lowered (Z150, as the
   stock cleaning step does) before the "Remove the build plate" prompt, so
   the plate is easy to take off. Without the cleaning steps nothing lowered
   it.
@@ -33,7 +62,7 @@ only changes when the file format does.
   same `home.t` share a frame and runs with a different `home.t` do not.
   Observation only: `G28` itself is unchanged.
 
-- `VT_CALIBRATION_LOOPS ... CLEAN=0` (console only) skips the heating,
+- `CLEAN=0` (console only, `VT_CALIBRATION_OPTIONS`) skips the heating,
   automatic cleaning and wipe prompt of the offset calibration for repeat runs;
   homing, preheat, the cool-down and the build plate check still run. Offset
   runs are logged with `cleaned` true/false and the slot report marks sessions

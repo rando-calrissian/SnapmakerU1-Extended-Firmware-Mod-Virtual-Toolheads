@@ -35,12 +35,13 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 import urllib.request
 
 # Release version of this mod as a whole (see CHANGELOG.md). The store has its
 # own SCHEMA_VERSION, which only changes when the file format does.
 VERSION = "0.7"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MCU_NAME_FMT = "mcu e%d"     # [mcu e0] .. [mcu e3] of the toolheads
 SYSFS_TTY = "/sys/class/tty"
 MAX_BACKUPS = 20            # oldest are deleted beyond this
@@ -221,6 +222,75 @@ def _migrate_v5(data):
     return data
 
 
+FRAME_SESSION = 300             # s: values saved this close share a frame
+
+
+def new_id():
+    """A random identifier (session, frame).  Identity only: it has no order
+    and does not depend on the clock."""
+    return str(uuid.uuid4())
+
+
+def _migrate_v6(data):
+    """Schema 6 -> 7: which coordinate frame each stored offset is in.
+
+    An offset calibration measures in the frame the homing before it set,
+    and values can only be compared when they share a frame.  Older data
+    has no such mark, so the save times are used once, here: values saved
+    within FRAME_SESSION of each other (one calibration saves all of its
+    toolheads within seconds) share a frame, everything else gets its own
+    (which can only flag too much, never too little).  Values that 0.7
+    stored relative to T0 ("anchored") join the frame of the toolhead in
+    slot 0; those measured without T0 keep their own."""
+    data = copy.deepcopy(data)
+    ths = data["toolheads"]
+
+    def epoch(t):
+        try:
+            return calendar.timegm(time.strptime(t, "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            return None
+
+    timed, unknown = [], []
+    for th_id, th in ths.items():
+        c = th["calibration"]
+        if c.get("base_position") is None:
+            c["frame"] = None
+        elif c.get("anchored") is None and epoch(c.get("at")) is not None:
+            timed.append((epoch(c["at"]), th_id))
+        elif c.get("anchored") is None:
+            unknown.append(th_id)           # no time (first-boot import)
+    frames = {}
+    last, fid = None, None
+    for t, th_id in sorted(timed):
+        if last is None or t - last > FRAME_SESSION:
+            fid = new_id()
+        frames[th_id] = fid
+        last = t
+    if unknown:
+        fid = new_id()
+        for th_id in unknown:
+            frames[th_id] = fid
+    layout = data.get("layout") or []
+    t0 = layout[0] if layout else None
+    for th_id, th in ths.items():
+        c = th["calibration"]
+        anchored = c.pop("anchored", None)
+        if c.get("base_position") is None:
+            c["frame"] = None
+        elif anchored is True:
+            c["frame"] = frames.get(t0) or new_id()
+        else:
+            c["frame"] = frames.get(th_id) or new_id()
+        if c.get("base_position") is not None:
+            frames.setdefault(th_id, c["frame"])
+        c["session"] = None
+        c["format"] = 2 if anchored is True else 1
+        c["mod_version"] = "0.7" if anchored is not None else None
+    data["schema_version"] = 7
+    return data
+
+
 def read_usb_serial(serialport, sysfs_tty=SYSFS_TTY):
     """USB serial number of the device behind a serial port path (for example
     /dev/serial/by-path/...), or None. The toolhead boards derive it from
@@ -386,6 +456,7 @@ class VirtualToolheadStore:
             "flow_adopted": False,
         }
         per_side = {"left": 0, "right": 0}
+        first_frame = new_id()      # imported from one stock calibration
         for i, slot in enumerate(slots):
             th_id = "th%d" % (i + 1)
             bp = slot.get("base_position")
@@ -408,6 +479,10 @@ class VirtualToolheadStore:
                     "at": None,
                     "slot": i if has_bp else None,
                     "epoch": 1,
+                    "frame": first_frame if has_bp else None,
+                    "session": None,
+                    "format": 1,
+                    "mod_version": None,
                 },
                 "pid": None,
                 "pid_profiles": {},
@@ -445,6 +520,12 @@ class VirtualToolheadStore:
                     migrated_from = 5
                 data = _migrate_v5(data)
                 version = 6
+                migrated = True
+            if version == 6:
+                if migrated_from is None:
+                    migrated_from = 6
+                data = _migrate_v6(data)
+                version = 7
                 migrated = True
             if version != SCHEMA_VERSION:
                 raise StoreError("Unsupported schema_version %r" % (version,))
@@ -614,6 +695,20 @@ class VirtualToolheadStore:
         return bool(c["valid"] and c["base_position"] is not None
                     and c["epoch"] == self.data["epoch"])
 
+    def frame_of(self, th_id):
+        return self.data["toolheads"][th_id]["calibration"].get("frame")
+
+    def frame_stale(self, th_id):
+        """True when a valid calibration is in another coordinate frame than
+        T0's: it was measured in a session that did not include T0 (or in
+        one before the stored T0 was measured).  Its offset may then be off
+        by the difference between the two frames (tens of um in Z, more in
+        Y).  Offsets measured together with T0 share its frame."""
+        ref = self.toolhead_in_slot(0)
+        if th_id == ref or not self.is_valid(th_id) or not self.is_valid(ref):
+            return False
+        return self.frame_of(th_id) != self.frame_of(ref)
+
     def effective_base_position(self, th_id):
         if not self.is_valid(th_id):
             return None
@@ -654,30 +749,30 @@ class VirtualToolheadStore:
                     all(abs(a - float(b)) <= POS_TOL
                         for a, b in zip(old, pos[:3])))
 
-    def rebase(self, th_id, pos):
-        """Move a stored calibration into another frame; it stays valid."""
-        c = self.data["toolheads"][th_id]["calibration"]
-        c["base_position"] = [float(v) for v in pos[:3]]
-        c["anchored"] = True
-
-    def record_calibration(self, th_id, pos, slot, now=None, anchored=None):
+    def record_calibration(self, th_id, pos, slot, now=None, frame=None,
+                           session=None):
         """Record a base_position seen in a slot.  Returns True if it is new
-        (different from what is stored, or the stored one was invalid)."""
+        (different from what is stored, or in another frame, or the stored
+        one was invalid).  `frame` is the coordinate frame the position is
+        expressed in (None: a frame of its own)."""
         c = self.data["toolheads"][th_id]["calibration"]
         pos = [float(v) for v in pos[:3]]
         old = c["base_position"]
         if old is not None and len(old) == 3 and \
+                frame in (None, c.get("frame")) and \
                 all(abs(a - b) <= POS_TOL for a, b in zip(old, pos)):
             return False
+        frame = frame or new_id()
         c["base_position"] = pos
         c["valid"] = True
         c["reason"] = None
         c["at"] = now or now_str()
         c["slot"] = slot
         c["epoch"] = self.data["epoch"]
-        # True: stored relative to T0 of the same session (frame-corrected);
-        # False: measured without T0, taken as it came; None: not known
-        c["anchored"] = anchored
+        c["frame"] = frame
+        c["session"] = session
+        c["format"] = 2
+        c["mod_version"] = VERSION
         return True
 
     # ---- PID tuning ------------------------------------------------------
@@ -888,7 +983,9 @@ class VirtualToolheadStore:
                        "installed": now or now_str()},
             "calibration": {"base_position": None, "valid": False,
                             "reason": "never_calibrated", "at": None,
-                            "slot": None, "epoch": self.data["epoch"]},
+                            "slot": None, "epoch": self.data["epoch"],
+                            "frame": None, "session": None, "format": 2,
+                            "mod_version": VERSION},
             "pid": None,
             "pid_profiles": {},
             "flow": {},
@@ -1248,11 +1345,15 @@ class VirtualToolheads:
         reg("VT_CALIBRATION_LOOPS", self.calibrator.cmd_VT_CALIBRATION_LOOPS,
             desc="Probe each toolhead N times in a row during the offset "
                  "calibration, from the menus too (N=1 is normal; DOCK=1 "
-                 "docks the toolhead between probes; CLEAN=0 skips the "
-                 "heating and cleaning steps; resets on restart)")
+                 "docks the toolhead between probes; resets on restart). "
+                 "See VT_CALIBRATION_OPTIONS for CLEAN and REF")
+        reg("VT_CALIBRATION_OPTIONS", self.calibrator.cmd_VT_CALIBRATION_OPTIONS,
+            desc="Options of the offset calibration: CLEAN=0 skips the "
+                 "heating and cleaning steps, REF=0 does not add T0 as the "
+                 "reference (both reset on restart; no arguments shows them)")
         reg("VT_CAL_LOG", self.cmd_VT_CAL_LOG,
             desc="Every calibration run is logged; show how much repeated "
-                 "runs vary ([TOOLHEAD=] [KIND=offset|pid|flow] "
+                 "runs vary ([TOOLHEAD=] [KIND=offset|pid|flow|store] "
                  "[ACTION=SUMMARY|SLOTS|SHOW|CLEAR] [COUNT=])")
         reg("VT_TRACE", self.cmd_VT_TRACE,
             desc="Debug: trace every G-code command "
@@ -1310,7 +1411,7 @@ class VirtualToolheads:
                 return
             th_id = self.store.toolhead_in_slot(slot)
             ex = self._slots()[slot]
-            rec = {"t": now_str(), "kind": kind, "slot": slot,
+            rec = {"t": now_str(), "kind": kind, "slot": slot, "ver": VERSION,
                    "toolhead": self.store.label(th_id), "id": th_id,
                    "nozzle": getattr(ex, 'nozzle_diameter', None),
                    "volume": getattr(ex, 'nozzle_volume_type', None)}
@@ -1357,6 +1458,8 @@ class VirtualToolheads:
         """Lines: per toolhead/kind the number of runs and the spread."""
         groups = collections.OrderedDict()
         for r in rows:
+            if r.get("kind") == "store":
+                continue                # what was stored, not a probe result
             if r.get("kind") == "flow" and r.get("outcome") in ("none", "default"):
                 continue
             groups.setdefault(self._cal_group(r), []).append(r)
@@ -1526,6 +1629,17 @@ class VirtualToolheads:
         if action == 'SHOW':
             count = gcmd.get_int('COUNT', 30, minval=1)
             for r in rows[-count:]:
+                if r.get("kind") == "store":
+                    slot = r.get("slot")
+                    gcmd.respond_info(
+                        "%s %s%s stored (%s) shift um=%s frame %s session %s"
+                        % (r["t"], r["toolhead"],
+                           "" if slot is None else " (T%d)" % slot,
+                           r.get("how"),
+                           [round(v * 1000.) for v in r.get("shift") or []],
+                           str(r.get("frame"))[:8],
+                           str(r.get("session"))[:8]))
+                    continue
                 vals = ", ".join("%s=%s" % (f, r.get(f)) for f in
                                  self.CAL_LOG_FIELDS[r["kind"]])
                 extra = r.get("outcome") or r.get("target") or ""
@@ -2995,7 +3109,7 @@ class VirtualToolheads:
             return                  # failed, or no Z homing (G28 X Y)
         try:
             self._home_seq += 1
-            rec = {"t": now_str(), "n": self._home_seq}
+            rec = {"t": now_str(), "n": self._home_seq, "session": new_id()}
             rec.update(ctx)
             rec.update(seen)
             try:
@@ -3323,32 +3437,40 @@ class VirtualToolheads:
         old = {t: st.stored_base(t) for t in ids}
         was_valid = {t: st.is_valid(t) for t in ids}
         th_of = {slot: st.toolhead_in_slot(slot) for slot in raws}
+        session = self.session_id()
         notes = []
+        stored = {}                       # slot -> (raw, stored, frame)
 
-        def put(slot, pos, anchored):
-            if st.record_calibration(th_of[slot], pos, slot,
-                                     anchored=anchored):
+        def put(slot, raw, pos, frame):
+            if st.record_calibration(th_of[slot], pos, slot, frame=frame,
+                                     session=session):
                 logging.info("virtual_toolheads: recorded calibration for %s "
                              "(slot %d)", st.label(th_of[slot]), slot)
+            stored[slot] = (raw, pos, st.frame_of(th_of[slot]))
 
+        how = "relative"
         if 0 not in raws:
+            how = "no_t0"
+            frame = new_id()
             for slot, raw in raws.items():
-                put(slot, raw, False)
+                put(slot, raw, raw, frame)
             notes.append(
                 "T0 was not measured in this calibration, so the new offsets "
-                "could not be corrected for the frame of this session (it "
+                "could not be tied to T0's frame (the frame of each session "
                 "typically differs by tens of um in Z, and by more in Y when "
-                "the bed temperature differs). Measure T0 together with the "
-                "toolhead next time: the calibration wizard does that unless "
-                "VT_CALIBRATION_LOOPS REF=0 was set.")
+                "the bed temperature differs). They are marked as not "
+                "aligned to T0. Measure T0 together with the toolhead next "
+                "time: the calibration wizard does that unless "
+                "VT_CALIBRATION_OPTIONS REF=0 was set.")
         else:
             raw_ref = raws[0]
             others = {k: v for k, v in raws.items() if k != 0}
             old_ref = old[ref_th]
             if old_ref is not None and was_valid[ref_th]:
+                frame = st.frame_of(ref_th) or new_id()
                 c = [o - r for o, r in zip(old_ref, raw_ref)]
                 for slot, raw in others.items():
-                    put(slot, [r + d for r, d in zip(raw, c)], True)
+                    put(slot, raw, [r + d for r, d in zip(raw, c)], frame)
                 if others:
                     notes.append(
                         "Offsets are stored relative to T0. This session's "
@@ -3356,6 +3478,7 @@ class VirtualToolheads:
                         "values were corrected for it, so toolheads "
                         "calibrated earlier stay valid." % self._um(c))
                 else:
+                    how = "t0_only"
                     notes.append(
                         "T0 is the reference for all offsets. Its new "
                         "measurement only describes this session's frame "
@@ -3368,52 +3491,71 @@ class VirtualToolheads:
                         "its nozzle was changed or knocked, tell VT "
                         "(VT_REPLACE_NOZZLE) and calibrate T0 together with "
                         "a toolhead that was not touched.")
-            elif old_ref is None:
-                for slot, raw in raws.items():
-                    put(slot, raw, True)
             else:
-                # T0 itself changed (new nozzle): its stored value is the old
-                # tip.  Toolheads measured with it are right; the others
-                # move by the change of T0, found from those.
+                # T0 has no usable stored value: a new nozzle, or a toolhead
+                # that was never calibrated (for example a second left-slot
+                # toolhead swapped in).  The other toolheads' stored values
+                # are still right, in their own frame.  A toolhead that was
+                # measured with T0 and is still valid tells that frame: T0
+                # (and the other measured ones) are stored in it, and the
+                # toolheads that were not measured stay as they are.
                 bridges = [(sl, raw) for sl, raw in others.items()
                            if was_valid[th_of[sl]] and old[th_of[sl]]]
-                for slot, raw in raws.items():
-                    put(slot, raw, bool(bridges) or None)
                 if bridges:
-                    delta = [0., 0., 0.]
+                    how = "bridge"
+                    c = [0., 0., 0.]
                     for sl, raw in bridges:
                         o = old[th_of[sl]]
                         for k in range(3):
-                            delta[k] += ((o[k] - old_ref[k])
-                                         - (raw[k] - raw_ref[k])) / len(bridges)
-                    measured = set(th_of.values())
-                    moved = 0
-                    for t in ids:
-                        if t in measured or old[t] is None \
-                                or not was_valid[t]:
-                            continue
-                        st.rebase(t, [raw_ref[k] + (old[t][k] - old_ref[k])
-                                      - delta[k] for k in range(3)])
-                        moved += 1
+                            c[k] += (o[k] - raw[k]) / len(bridges)
+                    frame = st.frame_of(th_of[bridges[0][0]]) or new_id()
+                    for slot, raw in raws.items():
+                        put(slot, raw, [raw[k] + c[k] for k in range(3)],
+                            frame)
+                    kept = [st.label(t) for t in ids
+                            if t not in set(th_of.values())
+                            and old[t] is not None and was_valid[t]]
                     notes.append(
-                        "T0 was measured again (changed nozzle). The "
-                        "toolhead(s) measured with it show how much T0 "
-                        "changed (%s); the %d other stored toolhead(s) were "
-                        "moved by that, so they stay valid." % (
-                            self._um([-d for d in delta]), moved))
+                        "T0 (%s) was measured again (new nozzle or "
+                        "toolhead). %s, measured with it, ties it to the "
+                        "frame of the stored offsets (this session differed "
+                        "by %s); %s." % (
+                            st.label(ref_th),
+                            ", ".join(st.label(th_of[sl])
+                                      for sl, _ in bridges),
+                            self._um([-x for x in c]),
+                            ("%s keep their calibration" % ", ".join(kept))
+                            if kept else "no other toolheads are stored"))
                 else:
+                    how = "first"
+                    frame = new_id()
+                    for slot, raw in raws.items():
+                        put(slot, raw, raw, frame)
                     notes.append(
                         "T0 was measured again but no other calibrated "
-                        "toolhead was measured with it, so the stored "
-                        "offsets of the others cannot be corrected for the "
-                        "change of T0. Calibrate T0 together with one "
-                        "toolhead that was not touched (the wizard adds T0 "
-                        "to any calibration), or recalibrate the others.")
+                        "toolhead was measured with it, so it cannot be tied "
+                        "to the stored offsets of the others. They are "
+                        "marked as not aligned to T0. Calibrate T0 together "
+                        "with one toolhead that was not touched (the wizard "
+                        "adds one to a T0 calibration), or recalibrate the "
+                        "others.")
+        for slot, (raw, pos, frame) in stored.items():
+            self.log_calibration(
+                "store", slot, session=session, frame=frame, how=how,
+                raw=[round(v, 6) for v in raw],
+                base=[round(v, 6) for v in pos],
+                shift=[round(p - r, 6) for p, r in zip(pos, raw)])
         self.frame_notes = notes
         try:
             self.gcode.respond_info("\n".join(notes))
         except Exception:
             pass
+
+    def session_id(self):
+        """Identifies the homing the running calibration is measured in (one
+        homing sets one frame); a new id when none was seen."""
+        sid = (self.last_home or {}).get("session")
+        return sid or new_id()
 
     def take_frame_notes(self):
         notes, self.frame_notes = self.frame_notes, []
@@ -3472,6 +3614,7 @@ class VirtualToolheads:
                 "invalid_reason": s.invalid_reason(th_id),
                 "calibrated_at": c["at"],
                 "calibrated_slot": c["slot"],
+                "frame_stale": s.frame_stale(th_id),
                 "pid": self._pid_status(th_id),
                 "needs": self._needs_status(s.slot_of(th_id), st),
                 "serial": th.get("serial"),
@@ -3596,6 +3739,8 @@ class VirtualToolheads:
         n = s.get(th_id)["nozzle"]
         state = "calibrated" if s.is_valid(th_id) else \
             "NEEDS CALIBRATION (%s)" % s.invalid_reason(th_id)
+        if s.frame_stale(th_id):
+            state = "calibrated, NOT ALIGNED TO T0 (recalibrate)"
         return "%s %.1fmm %s/%s  %s  %s" % (s.label(th_id),
                                                n["diameter"], n["volume_type"],
                                                n["material"], state,
@@ -4626,7 +4771,7 @@ class Calibrator:
         self.probe_runs = 1          # VT_CALIBRATION_LOOPS: probes per toolhead
         self.probe_dock = False      # ... docking the toolhead between them
         self.do_clean = True         # CLEAN=0: skip heating/cleaning steps
-        self.add_ref = True          # REF=0: do not add T0 as the reference
+        self.add_ref = True          # VT_CALIBRATION_OPTIONS REF=0: no T0 reference
         self._loop = None            # (run, runs, docked) of the probe now
         self.repeat_notes = []
         self._hold = False          # keep the guard up (PID phase is long)
@@ -4742,6 +4887,7 @@ class Calibrator:
                        "cleaned": bool(self.do_clean)}
             if self.vt.last_home:
                 ctx["home"] = dict(self.vt.last_home)
+                ctx["session"] = self.vt.last_home.get("session")
             self.vt.log_calibration("offset", slot, x=float(res[0]),
                                     y=float(res[1]), z=float(res[2]), **ctx)
         except Exception:
@@ -4842,29 +4988,47 @@ class Calibrator:
         if count is not None:
             self.probe_runs = count
             self.probe_dock = False
-            self.do_clean = True
         dock = gcmd.get_int('DOCK', None, minval=0, maxval=1)
         if dock is not None:
             self.probe_dock = bool(dock)
+        moved = self._set_options(gcmd)
+        gcmd.respond_info(
+            "Offset probe loops per toolhead: %d%s%s" % (
+                self.probe_runs,
+                ", docking between probes" if self.probe_dock else "",
+                "" if self.probe_runs == 1 else
+                " (every run is logged, the last one is saved; reset with "
+                "VT_CALIBRATION_LOOPS N=1)")
+            + ("\nCLEAN and REF are options of the calibration, not of the "
+               "loops: use VT_CALIBRATION_OPTIONS." if moved else ""))
+
+    def _set_options(self, gcmd):
+        """CLEAN= and REF=; returns whether either was given."""
         clean = gcmd.get_int('CLEAN', None, minval=0, maxval=1)
         if clean is not None:
             self.do_clean = bool(clean)
         ref = gcmd.get_int('REF', None, minval=0, maxval=1)
         if ref is not None:
             self.add_ref = bool(ref)
-        gcmd.respond_info(
-            "Offset probe loops per toolhead: %d%s%s%s" % (
-                self.probe_runs,
-                ", docking between probes" if self.probe_dock else "",
-                "" if self.do_clean else
-                ", skipping the heat and cleaning steps",
-                "" if self.probe_runs == 1 else
-                " (every run is logged, the last one is saved; reset with "
-                "VT_CALIBRATION_LOOPS N=1)") + (
-            "" if self.add_ref else
-            "\nT0 is NOT added as the reference (REF=0): offsets of a "
-            "single toolhead can then not be corrected for the frame of the "
-            "session. VT_CALIBRATION_LOOPS REF=1 turns it back on."))
+        return clean is not None or ref is not None
+
+    def cmd_VT_CALIBRATION_OPTIONS(self, gcmd):
+        self._set_options(gcmd)
+        gcmd.respond_info("\n".join([
+            "Offset calibration options (they reset on restart):",
+            "  CLEAN=%d: %s" % (1 if self.do_clean else 0,
+                                "heating and automatic cleaning run" if
+                                self.do_clean else
+                                "heating, cleaning and the wipe prompt are "
+                                "skipped (for repeat runs)"),
+            "  REF=%d: %s" % (1 if self.add_ref else 0,
+                              "T0 is measured too, as the reference, so the "
+                              "offsets are stored relative to it" if
+                              self.add_ref else
+                              "T0 is NOT added; the offsets of a toolhead "
+                              "calibrated alone are not tied to T0's frame "
+                              "and are marked as not aligned"),
+            "Probe loops per toolhead: VT_CALIBRATION_LOOPS N=<count>"]))
 
     def cmd_VT_CAL(self, gcmd):
         page = gcmd.get('PAGE', 'start').lower()
@@ -4964,9 +5128,20 @@ class Calibrator:
             text = "T%d: %s" % (slot, s.label(th_id))
             if any(self._needs(slot).values()):
                 text += " (needs it)"
+            elif s.frame_stale(th_id):
+                text += " (not aligned to T0)"
             buttons.append((text, start_cmd(toggled),
                             "primary" if slot in sel else None))
         p.buttons(buttons, per_row=2)
+        stale = [s.label(s.toolhead_in_slot(i)) for i in range(s.n_slots)
+                 if s.frame_stale(s.toolhead_in_slot(i))]
+        if stale:
+            p.text("Not aligned to T0: %s. Their offset was measured in an "
+                   "earlier session than T0's (or without T0), so it can be "
+                   "off by the difference between the sessions (tens of um "
+                   "in Z, more in Y). Select them to measure them against "
+                   "T0 again; the others keep their calibration."
+                   % ", ".join(stale))
         p.text("Offset calibration finds the position of each nozzle: heat, "
                "automatic clean (this extrudes filament, so load filament "
                "first), then you wipe the nozzle by hand and remove the "
@@ -5287,7 +5462,7 @@ class Calibrator:
                 "T0 (%s) is measured too, as the reference: every offset is "
                 "stored relative to it, so you can recalibrate a single "
                 "toolhead later without redoing the others "
-                "(VT_CALIBRATION_LOOPS REF=0 turns this off)."
+                "(VT_CALIBRATION_OPTIONS REF=0 turns this off)."
                 % self._label(0)]
         if len(sel) > 1:
             return sel, notes
@@ -5304,7 +5479,7 @@ class Calibrator:
                     "toolheads stay valid." if not own_valid else
                     "Nothing would be stored for T0 otherwise.")]
         if not self.add_ref:
-            why = "VT_CALIBRATION_LOOPS REF=0 is set"
+            why = "VT_CALIBRATION_OPTIONS REF=0 is set"
         else:
             why = "no other toolhead has a valid calibration yet"
         return sel, [
@@ -5345,7 +5520,7 @@ class Calibrator:
         tool = sel[i]
         csv = csv_slots(sel)
         if not self.do_clean:
-            # VT_CALIBRATION_LOOPS CLEAN=0: no filament has run since the
+            # VT_CALIBRATION_OPTIONS CLEAN=0: no filament has run since the
             # last cleaning; go straight to the cool-down to probe temperature
             self._cool(sel, i)
             return
@@ -5506,7 +5681,7 @@ class Calibrator:
                             if self.probe_dock else ""))
         if not self.do_clean:
             lines.append("The heating and cleaning steps were skipped "
-                         "(VT_CALIBRATION_LOOPS CLEAN=0).")
+                         "(VT_CALIBRATION_OPTIONS CLEAN=0).")
         lines += self.repeat_notes
         self.repeat_notes = []
         lines += self.vt.take_frame_notes()
